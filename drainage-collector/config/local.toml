@@ -1,0 +1,34 @@
+# 本地演示配置：进程内模拟站 + 嵌入式 SQLite 持久化替身，零外部依赖。
+[server]
+listen = "127.0.0.1:8080"
+
+[database]
+# 文件型 SQLite：进程退出后进度与抓取结果保留，重启可续跑。
+url = "sqlite://data/drainage.db"
+
+[mock]
+base_port = 9100
+
+# 两站各自的发起频率与在途请求上限。
+[[stations]]
+id = "station-a"
+name = "城东养护站"
+base_url = "http://127.0.0.1:9100"
+format = "html"
+min_interval_ms = 20
+max_inflight = 2
+watermark_seq = 0
+
+[[stations]]
+id = "station-b"
+name = "河西养护站"
+base_url = "http://127.0.0.1:9101"
+format = "json"
+min_interval_ms = 20
+max_inflight = 2
+watermark_seq = 0
+
+[[entry_points]]
+station_id = "station-a"
+page_key = "a0"
+label = "城东入流口"

@@ -1,0 +1,49 @@
+[package]
+name = "drainage-collector"
+version = "0.1.0"
+edition = "2021"
+description = "市政排水入流口下游设施采集服务"
+default-run = "drainage-collector"
+
+[lib]
+name = "drainage_collector"
+path = "src/lib.rs"
+
+[[bin]]
+name = "drainage-collector"
+path = "src/main.rs"
+
+[[bin]]
+name = "mock-server"
+path = "src/bin/mock-server.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "io-util", "signal"] }
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "any", "sqlite", "postgres", "macros", "migrate"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+scraper = "0.20"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+rand = "0.8"
+async-trait = "0.1"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.dev]
+# 本地开发优先编译速度。
+opt-level = 0
+debug = 1
+incremental = true
+
+[profile.test]
+# 测试只依赖少量计算，关闭优化换取更快编译（依赖就绪后测试 < 80s）。
+opt-level = 0
+debug = 1
+incremental = true

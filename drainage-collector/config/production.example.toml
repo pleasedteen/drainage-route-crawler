@@ -1,0 +1,31 @@
+# 生产配置示例：PostgreSQL + 真实站点 HTTP。
+[server]
+listen = "0.0.0.0:8080"
+
+[database]
+# 连接串走标准 libpq 形式，例如：
+# postgres://drainage:drainage@postgres.internal:5432/drainage
+url = "postgres://drainage:drainage@127.0.0.1:5432/drainage"
+
+[[stations]]
+id = "station-a"
+name = "城东养护站"
+base_url = "https://stations.example.org/a"
+format = "html"
+min_interval_ms = 200
+max_inflight = 4
+watermark_seq = 0
+
+[[stations]]
+id = "station-b"
+name = "河西养护站"
+base_url = "https://stations.example.org/b"
+format = "json"
+min_interval_ms = 300
+max_inflight = 3
+watermark_seq = 0
+
+[[entry_points]]
+station_id = "station-a"
+page_key = "a0"
+label = "城东入流口"
