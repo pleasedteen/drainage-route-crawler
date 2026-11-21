@@ -63,11 +63,15 @@ pub trait PageClient: Send + Sync {
     /// 读取某站当前登记截止序号。
     async fn fetch_state(&self, station: &StationConfig) -> Result<i64>;
 
-    /// 续读变更清单：返回严格大于 after_seq 的一页及下一页游标。
+    /// 续读一页变更清单：只返回 `after_seq < seq <= until_seq` 的条目，
+    /// 以及下一页游标（无更多 <= until_seq 的条目时为 None）。
+    ///
+    /// 截止点随请求一起发送，由站点侧裁剪，客户端因此不需要整段清单。
     async fn fetch_changes(
         &self,
         station: &StationConfig,
         after_seq: i64,
+        until_seq: i64,
     ) -> Result<(Vec<ChangeLogEntry>, Option<i64>)>;
 }
 
@@ -223,11 +227,13 @@ impl PageClient for HttpPageClient {
         &self,
         station: &StationConfig,
         after_seq: i64,
+        until_seq: i64,
     ) -> Result<(Vec<ChangeLogEntry>, Option<i64>)> {
         let url = format!(
-            "{}/changes?after={}",
+            "{}/changes?after={}&until={}",
             station.base_url.trim_end_matches('/'),
-            after_seq
+            after_seq,
+            until_seq
         );
         let body = self.http.get(&url).send().await?.text().await?;
         let parsed = parse_json_changes(&body)?;
@@ -241,8 +247,11 @@ impl PageClient for HttpPageClient {
                 revision: c.revision,
                 kind: c.kind,
             })
+            .filter(|c| c.seq <= until_seq)
             .collect();
-        Ok((entries, parsed.next_after))
+        // 站点可忽略 until 参数；客户端仍以本地裁剪为准，越界页游标不再前进。
+        let next = parsed.next_after.filter(|n| *n <= until_seq);
+        Ok((entries, next))
     }
 }
 
@@ -344,44 +353,34 @@ impl Fetcher {
         }
     }
 
-    /// 续读变更清单直到无更多页，且只保留不超过截止点的条目。
-    pub async fn fetch_changes_until(
+    /// 从 `after_seq` 起续读一页变更清单（调用方负责按页落库并推进游标）。
+    ///
+    /// 只请求、返回一页，因此调用方内存里最多只有一页未落库清单；不再把
+    /// 整段清单读进内存。`until_seq` 随请求发送给站点侧裁剪。
+    pub async fn fetch_changes_page(
         &self,
         station: &StationConfig,
         after_seq: i64,
-        cutoff: i64,
-    ) -> Result<Vec<ChangeLogEntry>> {
+        until_seq: i64,
+    ) -> Result<(Vec<ChangeLogEntry>, Option<i64>)> {
         let ctl = self.controller(station).await;
-        let mut cursor = after_seq;
-        let mut out = Vec::new();
+        let mut attempt = 0;
         loop {
-            let mut attempt = 0;
-            let (entries, next) = loop {
-                attempt += 1;
-                let _permit = ctl.acquire().await;
-                match self.client.fetch_changes(station, cursor).await {
-                    Ok(v) => break v,
-                    Err(e) if attempt >= MAX_ATTEMPTS => return Err(e),
-                    Err(_) => {
-                        drop(_permit);
-                        tokio::time::sleep(Duration::from_millis(100) * attempt).await;
-                    }
+            attempt += 1;
+            let _permit = ctl.acquire().await;
+            match self
+                .client
+                .fetch_changes(station, after_seq, until_seq)
+                .await
+            {
+                Ok(v) => return Ok(v),
+                Err(e) if attempt >= MAX_ATTEMPTS => return Err(e),
+                Err(_) => {
+                    drop(_permit);
+                    tokio::time::sleep(Duration::from_millis(100) * attempt).await;
                 }
-            };
-            let mut stop = false;
-            for e in entries {
-                if e.seq > cutoff {
-                    stop = true;
-                    break;
-                }
-                out.push(e);
-            }
-            match next {
-                Some(n) if !stop && n > cursor => cursor = n,
-                _ => break,
             }
         }
-        Ok(out)
     }
 }
 

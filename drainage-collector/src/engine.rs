@@ -70,6 +70,18 @@ impl Engine {
         Ok(open)
     }
 
+    /// 在当前进程内续跑一个已存在的 `running` 轮次（“另一入口续采”）。
+    ///
+    /// 与启动时自动续跑走同一条执行路径；已确认的进度与清单游标从库里读取，
+    /// 因此不会重读已收到的清单页，也不依赖其它轮次的进度。
+    pub async fn resume_run(self: &Arc<Self>, run_id: i64) -> Result<()> {
+        let run = self.store.get_run(run_id).await?;
+        if run.status != RunStatus::Running {
+            return Err(anyhow!("轮次 {run_id} 不在运行中"));
+        }
+        self.execute_run(run_id).await
+    }
+
     /// 启动新轮次。每轮开始时固化各站登记截止点。
     pub async fn start_run(self: &Arc<Self>, entry_id: i64, mode: RunMode) -> Result<i64> {
         let entry = self
@@ -123,33 +135,24 @@ impl Engine {
         let station_by_id: HashMap<String, StationConfig> =
             stations.iter().map(|s| (s.id.clone(), s.clone())).collect();
 
-        // 3) 按固化截止点续读各站变更清单并落库（崩溃后重复执行幂等）。
-        //    清单同时承担“业务时间可早于登记时间”的正确排序：一切以登记 seq 为准。
+        // 3) 按固化截止点续读各站变更清单并逐页落库（崩溃后重复执行幂等）。
+        //    每站只保留一页未落库清单：取一页、事务内落库并推进游标，再取下一页。
+        //    游标随轮次数据一起持久化，重启或另一入口续采时跳过已确认范围；
+        //    清单请求携带本轮截止点，站点侧裁剪，不会把整段清单读进内存。
+        //    早于本轮截止点的已确认范围（反弹自更高截止点或更晚轮次）直接跳过，
+        //    因此某轮次卡在后续清单页时不会拖住已齐清单的较早轮次。
         for st in &stations {
             let cutoff = *run.watermarks.get(&st.id).unwrap_or(&0);
-            let after = self.max_stored_change_seq(&st.id).await?;
-            let changes = self.fetcher.fetch_changes_until(st, after, cutoff).await?;
-            for c in changes {
-                self.store.insert_change(&c).await?;
-            }
+            self.sync_change_list(st, cutoff).await?;
         }
 
         // 4) 构建页面目标修订索引：(station, page) -> 截止点内最新 (seq, revision)。
+        //    由数据库按页聚合，内存中只保留每个页面一条目标，不保留整段清单。
         let mut target_index: HashMap<(String, String), (i64, i64)> = HashMap::new();
         for st in &stations {
             let cutoff = *run.watermarks.get(&st.id).unwrap_or(&0);
-            for c in self.store.list_changes(&st.id, 0).await? {
-                if c.seq > cutoff {
-                    continue;
-                }
-                target_index
-                    .entry((c.station_id.clone(), c.page_key.clone()))
-                    .and_modify(|cur| {
-                        if c.seq > cur.0 {
-                            *cur = (c.seq, c.revision);
-                        }
-                    })
-                    .or_insert((c.seq, c.revision));
+            for (page_key, seq, revision) in self.store.page_targets_up_to(&st.id, cutoff).await? {
+                target_index.insert((st.id.clone(), page_key), (seq, revision));
             }
         }
 
@@ -201,10 +204,58 @@ impl Engine {
         Ok(())
     }
 
-    async fn max_stored_change_seq(&self, station_id: &str) -> Result<i64> {
-        // list_changes 按 seq 升序，取末尾即最大；条目量在本地规模下可接受。
-        let all = self.store.list_changes(station_id, 0).await?;
-        Ok(all.last().map(|c| c.seq).unwrap_or(0))
+    /// 把某站变更清单同步到截止点 `cutoff`，逐页落库并推进确认游标。
+    ///
+    /// 不变量：
+    /// - 一页条目与其游标推进在同一事务提交，崩溃后整页重读或整页已确认；
+    /// - 游标可跨过 seq 空洞：只要求“页内条目之间连续”，页与页之间由站点分页
+    ///   保证没有遗漏，因此空档（例如登记序号跳号）也会被取齐；
+    /// - 若某条目的 seq 超过截止点，则本轮所需清单已齐，停止续读。
+    async fn sync_change_list(&self, station: &StationConfig, cutoff: i64) -> Result<()> {
+        let mut cursor = self.store.change_cursor(&station.id).await?;
+        // 游标已越过截止点：本轮所需范围已全部在库。
+        if cursor >= cutoff {
+            return Ok(());
+        }
+        // 防御：若截止点内已有条目的 seq 高于游标（例如升级前的旧库或手工写入），
+        // 从库里补一个不超过截止点的起点，避免漏取 (max, cutoff] 之间的登记。
+        if let Some(max_seq) = self
+            .store
+            .latest_change_seq_up_to(&station.id, cutoff)
+            .await?
+        {
+            if max_seq > cursor {
+                cursor = max_seq;
+            }
+        }
+        loop {
+            if cursor >= cutoff {
+                break;
+            }
+            let (mut entries, next) = self
+                .fetcher
+                .fetch_changes_page(station, cursor, cutoff)
+                .await?;
+            // 防御站点忽略 until：超出截止点的条目留给后续轮次。
+            entries.retain(|c| c.seq > cursor && c.seq <= cutoff);
+            entries.sort_by_key(|c| c.seq);
+            let page_max = entries.last().map(|c| c.seq).unwrap_or(cursor);
+            let advanced = next
+                .map(|n| n.min(cutoff))
+                .filter(|n| *n > cursor)
+                .unwrap_or(page_max)
+                .max(cursor);
+            // 一页条目 + 游标同一事务提交。
+            self.store
+                .ingest_change_page(&station.id, &entries, advanced)
+                .await?;
+            if advanced <= cursor {
+                // 站点没有前进：没有更多不超过截止点的条目。
+                break;
+            }
+            cursor = advanced;
+        }
+        Ok(())
     }
 
     /// 解析某页面在本轮截止点下的抓取请求。

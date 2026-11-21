@@ -68,6 +68,14 @@ CREATE TABLE change_log (
 );
 CREATE INDEX ix_change_station_seq ON change_log (station_id, seq);
 
+-- 各站变更清单已确认落库的范围：seq <= ingested_seq 的条目均已入库。
+-- 采集按页落库并推进该游标，因此进程重启或另一入口续采时不会重读已确认的页。
+-- 它与轮次截止点 watermarks 相互独立：游标可领先于某个较早轮次的截止点。
+CREATE TABLE station_change_cursor (
+    station_id   TEXT PRIMARY KEY,
+    ingested_seq INTEGER NOT NULL
+);
+
 -- 采集轮次。watermarks 为 JSON：轮次开始时固化的各站登记截止点。
 CREATE TABLE runs (
     id         __PK_AUTO__,

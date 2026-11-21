@@ -92,6 +92,38 @@ impl Store {
                 .execute(&self.pool)
                 .await?;
         }
+        if current < 2 {
+            // v2：变更清单确认游标。旧库按已有清单的最大 seq 回填，避免升级后重读。
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS station_change_cursor (\
+                   station_id TEXT PRIMARY KEY, ingested_seq INTEGER NOT NULL)",
+            )
+            .execute(&self.pool)
+            .await?;
+            let rows = sqlx::query(
+                "SELECT station_id, MAX(seq) AS max_seq FROM change_log GROUP BY station_id",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            for r in rows {
+                let station_id: String = r.try_get("station_id")?;
+                let max_seq: i64 = r.try_get("max_seq")?;
+                sqlx::query(
+                    "INSERT INTO station_change_cursor (station_id, ingested_seq) VALUES (?, ?) \
+                     ON CONFLICT(station_id) DO UPDATE SET \
+                       ingested_seq = CASE WHEN excluded.ingested_seq > station_change_cursor.ingested_seq \
+                                           THEN excluded.ingested_seq ELSE station_change_cursor.ingested_seq END",
+                )
+                .bind(&station_id)
+                .bind(max_seq)
+                .execute(&self.pool)
+                .await?;
+            }
+            sqlx::query("INSERT INTO schema_versions (version, applied_at) VALUES (2, ?)")
+                .bind(now_millis())
+                .execute(&self.pool)
+                .await?;
+        }
         if self.kind == DbKind::Sqlite {
             // 写串行化后 WAL 即可；打开外键约束。
             for pragma in ["PRAGMA foreign_keys = ON", "PRAGMA journal_mode = WAL"] {
@@ -392,6 +424,105 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// 落库一页变更清单，并把该站已确认游标推进到本页最大 seq。
+    ///
+    /// 条目与游标在同一事务内提交：崩溃后要么整页已确认、要么整页需要重读，
+    /// 不会出现“游标已越过但条目缺失”的空洞。调用方保证本页条目连续
+    /// （`after_seq` 与页内首个 seq 之间没有已知空洞），因此游标可以安全跳过。
+    pub async fn ingest_change_page(
+        &self,
+        station_id: &str,
+        seqs: &[ChangeLogEntry],
+        next_cursor: i64,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for e in seqs {
+            sqlx::query(
+                "INSERT INTO change_log (seq, station_id, page_key, revision, kind) VALUES (?, ?, ?, ?, ?) \
+                 ON CONFLICT(station_id, seq) DO NOTHING",
+            )
+            .bind(e.seq)
+            .bind(&e.station_id)
+            .bind(&e.page_key)
+            .bind(e.revision)
+            .bind(&e.kind)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO station_change_cursor (station_id, ingested_seq) VALUES (?, ?) \
+             ON CONFLICT(station_id) DO UPDATE SET \
+               ingested_seq = CASE WHEN excluded.ingested_seq > station_change_cursor.ingested_seq \
+                                   THEN excluded.ingested_seq ELSE station_change_cursor.ingested_seq END",
+        )
+        .bind(station_id)
+        .bind(next_cursor)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 某站变更清单已确认落库的范围（seq <= 返回值均已在库）。
+    pub async fn change_cursor(&self, station_id: &str) -> Result<i64> {
+        let row =
+            sqlx::query("SELECT ingested_seq FROM station_change_cursor WHERE station_id = ?")
+                .bind(station_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row
+            .map(|r| r.try_get::<i64, _>("ingested_seq").unwrap_or_default())
+            .unwrap_or(0))
+    }
+
+    /// 截止点内某站最新一条变更的 seq（用于判定清单是否已齐）。
+    pub async fn latest_change_seq_up_to(
+        &self,
+        station_id: &str,
+        cutoff: i64,
+    ) -> Result<Option<i64>> {
+        let row =
+            sqlx::query("SELECT MAX(seq) AS m FROM change_log WHERE station_id = ? AND seq <= ?")
+                .bind(station_id)
+                .bind(cutoff)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(row.try_get::<Option<i64>, _>("m").unwrap_or_default())
+    }
+
+    /// 截止点内每个页面的目标修订：`(page_key, seq, revision)`，取 (seq, revision) 最大者。
+    ///
+    /// 结果按页面聚合，页面数量级有限；不把整段变更清单读入内存。
+    /// 两种数据库都支持相关子查询取最大行；同一 seq 唯一，故结果确定。
+    pub async fn page_targets_up_to(
+        &self,
+        station_id: &str,
+        cutoff: i64,
+    ) -> Result<Vec<(String, i64, i64)>> {
+        let rows = sqlx::query(
+            "SELECT c.page_key, c.seq, c.revision FROM change_log c \
+             WHERE c.station_id = ? AND c.seq <= ? \
+               AND c.seq = (SELECT MAX(c2.seq) FROM change_log c2 \
+                            WHERE c2.station_id = c.station_id AND c2.page_key = c.page_key \
+                              AND c2.seq <= ?)",
+        )
+        .bind(station_id)
+        .bind(cutoff)
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.try_get::<String, _>("page_key").unwrap_or_default(),
+                    r.try_get::<i64, _>("seq").unwrap_or_default(),
+                    r.try_get::<i64, _>("revision").unwrap_or_default(),
+                )
+            })
+            .collect())
     }
 
     // ---------- 采集轮次 ----------

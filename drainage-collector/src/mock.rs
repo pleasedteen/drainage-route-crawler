@@ -127,6 +127,8 @@ impl MockStation {
 #[derive(Clone, Default)]
 pub struct MockWorld {
     inner: Arc<RwLock<HashMap<String, MockStation>>>,
+    /// 每站收到的变更清单请求游标 `(after, until)`，按到达顺序记录，供测试核对。
+    change_requests: Arc<RwLock<Vec<(String, i64, i64)>>>,
 }
 
 impl MockWorld {
@@ -150,6 +152,56 @@ impl MockWorld {
         if let Some(s) = g.get_mut(id) {
             f(s);
         }
+    }
+
+    /// 记录一次变更清单请求（站点侧真实收到的 `after` / `until`）。
+    fn record_change_request(&self, station_id: &str, after: i64, until: i64) {
+        self.change_requests
+            .write()
+            .unwrap()
+            .push((station_id.to_string(), after, until));
+    }
+
+    /// 全部变更清单请求游标快照。
+    pub fn change_requests(&self) -> Vec<(String, i64, i64)> {
+        self.change_requests.read().unwrap().clone()
+    }
+
+    /// 清空请求记录（便于分段核对）。
+    pub fn clear_change_requests(&self) {
+        self.change_requests.write().unwrap().clear();
+    }
+
+    /// 按站裁剪后的一页变更清单：`after < seq <= until`，每页至多 `page_size` 条。
+    ///
+    /// `next_after` 为页内最后一条的 seq（无更多不超过 `until` 的条目时为 None）。
+    /// 登记 seq 允许有空洞：游标跳到页内最后一条即可，不必连续。
+    fn changes_page(
+        &self,
+        station_id: &str,
+        after: i64,
+        until: i64,
+        page_size: usize,
+    ) -> (Vec<ChangeLogEntry>, Option<i64>) {
+        let st = match self.inner.read().unwrap().get(station_id) {
+            Some(s) => s.clone(),
+            None => return (vec![], None),
+        };
+        let mut entries: Vec<ChangeLogEntry> = st
+            .change_log
+            .iter()
+            .filter(|e| e.seq > after && e.seq <= until)
+            .cloned()
+            .collect();
+        entries.sort_by_key(|e| e.seq);
+        let full = entries.len() == page_size;
+        entries.truncate(page_size);
+        let next = if full {
+            entries.last().map(|e| e.seq)
+        } else {
+            None
+        };
+        (entries, next)
     }
 
     /// 构造标准演示图：跨站路线、汇合与回流成环，外加一轮后续修订。
@@ -370,25 +422,13 @@ impl PageClient for MockPageClient {
         &self,
         station: &StationConfig,
         after_seq: i64,
+        until_seq: i64,
     ) -> Result<(Vec<ChangeLogEntry>, Option<i64>)> {
-        let st = match self.world.get_station(&station.id) {
-            Some(s) => s,
-            None => return Ok((vec![], None)),
-        };
-        let page_size = 3;
-        let entries: Vec<_> = st
-            .change_log
-            .iter()
-            .filter(|e| e.seq > after_seq)
-            .take(page_size)
-            .cloned()
-            .collect();
-        let next = if entries.len() == page_size {
-            entries.last().map(|e| e.seq)
-        } else {
-            None
-        };
-        Ok((entries, next))
+        self.world
+            .record_change_request(&station.id, after_seq, until_seq);
+        Ok(self
+            .world
+            .changes_page(&station.id, after_seq, until_seq, 3))
     }
 }
 
@@ -445,6 +485,7 @@ struct ChangesResp {
 #[derive(serde::Deserialize)]
 struct ChangesQuery {
     after: Option<i64>,
+    until: Option<i64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -480,21 +521,10 @@ async fn changes_handler(
     State((world, sid)): State<HttpState>,
     Query(q): Query<ChangesQuery>,
 ) -> AxumJson<ChangesResp> {
-    let st = world.get_station(sid);
     let after = q.after.unwrap_or(0);
-    let page_size = 3;
-    let entries: Vec<ChangeLogEntry> = st
-        .iter()
-        .flat_map(|s| s.change_log.iter())
-        .filter(|e| e.seq > after)
-        .take(page_size)
-        .cloned()
-        .collect();
-    let next_after = if entries.len() == page_size {
-        entries.last().map(|e| e.seq)
-    } else {
-        None
-    };
+    let until = q.until.unwrap_or(i64::MAX);
+    world.record_change_request(sid, after, until);
+    let (entries, next_after) = world.changes_page(sid, after, until, 3);
     AxumJson(ChangesResp {
         changes: entries,
         next_after,
