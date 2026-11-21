@@ -11,8 +11,14 @@
 //! 所有进度都在确认落库后才推进：抓取结果、链接、可达关系、页面状态。
 //! 进程退出后重启，`running` 轮次的 `fetching` 页面收回为 `pending`，
 //! 工作线程从头消费队列即可接着完成，已完成页面不会重抓。
+//!
+//! ## 逐站就绪
+//! 轮次开始固化的截止点彼此独立：某站的变更清单仍在等待（退避 / 等待期）
+//! 或该站页面积压时，其他站已就绪的页面照常认领、抓取、落库。工作线程
+//! 只会从“清单已读完且本站不在等待期”的站点里认领页面。
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use tokio::sync::Notify;
@@ -32,6 +38,24 @@ pub struct Engine {
 enum ProcessOutcome {
     Processed { links: Vec<LinkRef>, revision: i64 },
     Gone,
+}
+
+/// 轮次内的逐站就绪状态，供变更清单读取任务与工作线程共享。
+///
+/// 页面只有在“本站变更清单已续读到截止点”后才可认领：目标修订索引在该刻
+/// 已完整，不会拿半截索引去解析页面。各站彼此独立，先就绪的站先开工。
+#[derive(Default)]
+struct RunState {
+    /// 清单已读完的站点。
+    ready: HashSet<String>,
+    /// 清单最终读取失败的站点及原因。
+    failed: HashMap<String, String>,
+    /// (station, page) -> (seq, revision)，由各站就绪时写入；只写本站条目。
+    targets: HashMap<(String, String), (i64, i64)>,
+    /// 已结束（成功或失败）的清单读取任务数。
+    preparers_done: usize,
+    /// 清单读取任务总数。
+    preparers_total: usize,
 }
 
 impl Engine {
@@ -84,11 +108,25 @@ impl Engine {
             }
         }
 
-        // 1) 轮次开始：逐站读取并固化登记截止点。
+        // 1) 轮次开始：逐站读取并固化登记截止点。各站并发读取、互不等待，
+        //    因此某站仍在等待期不会推迟其他站的截止点；任一站读取失败（含
+        //    非成功响应、Retry-After 用尽）则不创建轮次，交由值守端重试。
         let stations = self.store.list_stations().await?;
-        let mut watermarks = BTreeMap::new();
+        let mut reads = Vec::new();
         for st in &stations {
-            let cutoff = self.fetcher.fetch_state(st).await?;
+            let fetcher = self.fetcher.clone();
+            let stc = st.clone();
+            reads.push(tokio::spawn(async move { fetcher.fetch_state(&stc).await }));
+        }
+        // 先收齐所有读取结果，避免任一失败时遗留仍在后台发请求的任务。
+        let mut results = Vec::with_capacity(reads.len());
+        for read in reads {
+            results.push(read.await?);
+        }
+        let mut watermarks = BTreeMap::new();
+        for (st, result) in stations.iter().zip(results) {
+            let cutoff = result
+                .map_err(|e| anyhow!("站点 {} 状态读取失败（未创建轮次）：{e}", st.id))?;
             watermarks.insert(st.id.clone(), cutoff);
         }
         let run_id = self.store.create_run(entry_id, mode, &watermarks).await?;
@@ -123,37 +161,26 @@ impl Engine {
         let station_by_id: HashMap<String, StationConfig> =
             stations.iter().map(|s| (s.id.clone(), s.clone())).collect();
 
-        // 3) 按固化截止点续读各站变更清单并落库（崩溃后重复执行幂等）。
-        //    清单同时承担“业务时间可早于登记时间”的正确排序：一切以登记 seq 为准。
+        // 3) 逐站续读变更清单到**该站自己的**截止点。各站并发读取、互不等待：
+        //    某站清单在退避或等待期时，其他站先读完先就绪。读取失败（含非成功
+        //    响应、Retry-After 用尽）的站点不会就绪，其页面也不会被认领，
+        //    本轮最终按失败处理。
+        let state = Arc::new(Mutex::new(RunState {
+            preparers_total: stations.len(),
+            ..Default::default()
+        }));
         for st in &stations {
-            let cutoff = *run.watermarks.get(&st.id).unwrap_or(&0);
-            let after = self.max_stored_change_seq(&st.id).await?;
-            let changes = self.fetcher.fetch_changes_until(st, after, cutoff).await?;
-            for c in changes {
-                self.store.insert_change(&c).await?;
-            }
+            let eng = self.clone();
+            let run = run.clone();
+            let st = st.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                eng.prepare_station(&run, &st, &state).await;
+                eng.wake.notify_waiters();
+            });
         }
 
-        // 4) 构建页面目标修订索引：(station, page) -> 截止点内最新 (seq, revision)。
-        let mut target_index: HashMap<(String, String), (i64, i64)> = HashMap::new();
-        for st in &stations {
-            let cutoff = *run.watermarks.get(&st.id).unwrap_or(&0);
-            for c in self.store.list_changes(&st.id, 0).await? {
-                if c.seq > cutoff {
-                    continue;
-                }
-                target_index
-                    .entry((c.station_id.clone(), c.page_key.clone()))
-                    .and_modify(|cur| {
-                        if c.seq > cur.0 {
-                            *cur = (c.seq, c.revision);
-                        }
-                    })
-                    .or_insert((c.seq, c.revision));
-            }
-        }
-
-        // 5) 工作线程消费页面队列。SQLite 下连接池为 1，写天然串行；
+        // 4) 工作线程消费页面队列。SQLite 下连接池为 1，写天然串行；
         //    抓取在锁外进行，各站节奏由 Fetcher 的独立闸门控制。
         let worker_count = stations
             .iter()
@@ -163,18 +190,43 @@ impl Engine {
         let mut handles = Vec::new();
         for _ in 0..worker_count {
             let eng = self.clone();
-            let idx = target_index.clone();
+            let state = state.clone();
             let smap = station_by_id.clone();
             let ent = entry.clone();
             handles.push(tokio::spawn(async move {
-                eng.worker(run_id, ent, idx, smap).await
+                eng.worker(run_id, ent, state, smap).await
             }));
         }
         for h in handles {
             h.await??;
         }
 
-        // 6) 收尾：推进站点水位，标记轮次结果。
+        // 5) 收尾：先确认所有站的清单都已读完（失败站按失败处理），再落轮次结果。
+        let (failed, unfinished) = {
+            let g = state.lock().unwrap();
+            (g.failed.clone(), g.preparers_done < g.preparers_total)
+        };
+        if unfinished || !failed.is_empty() {
+            // 清单未就绪站点的页面不会被认领，这里统一按失败收尾，避免队列悬空。
+            let detail = if failed.is_empty() {
+                "未知站点清单未读完".to_string()
+            } else {
+                failed
+                    .iter()
+                    .map(|(s, e)| format!("{s}: {e}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            self.store
+                .fail_pending_run_pages(run_id, "站点状态或变更清单读取失败")
+                .await?;
+            let msg = format!("站点状态或变更清单读取失败：{detail}");
+            self.store
+                .update_run_status(run_id, RunStatus::Failed, Some(&msg))
+                .await?;
+            return Err(anyhow!(msg));
+        }
+
         let counts = self.store.count_run_pages(run_id).await?;
         if counts.failed > 0 {
             let msg = format!("{} 个页面抓取失败，可达关系为部分结果", counts.failed);
@@ -201,6 +253,53 @@ impl Engine {
         Ok(())
     }
 
+    /// 读取某站变更清单到截止点，写入该站的目标修订索引并标记就绪。
+    /// 失败（含 `Retry-After` 用尽、非成功响应）时记录原因，该站不就绪。
+    async fn prepare_station(&self, run: &Run, station: &StationConfig, state: &Mutex<RunState>) {
+        let cutoff = *run.watermarks.get(&station.id).unwrap_or(&0);
+        let result = async {
+            // 已读过的前缀从库里取（崩溃续跑幂等）。
+            let after = self.max_stored_change_seq(&station.id).await?;
+            let changes = self
+                .fetcher
+                .fetch_changes_until(station, after, cutoff)
+                .await?;
+            for c in changes {
+                self.store.insert_change(&c).await?;
+            }
+            // 只按截止点内的条目为本站构建索引（业务时间可早于登记，一切以 seq 为准）。
+            let mut targets: HashMap<(String, String), (i64, i64)> = HashMap::new();
+            for c in self.store.list_changes(&station.id, 0).await? {
+                if c.seq > cutoff {
+                    continue;
+                }
+                targets
+                    .entry((c.station_id.clone(), c.page_key.clone()))
+                    .and_modify(|cur| {
+                        if c.seq > cur.0 {
+                            *cur = (c.seq, c.revision);
+                        }
+                    })
+                    .or_insert((c.seq, c.revision));
+            }
+            Ok::<_, anyhow::Error>(targets)
+        }
+        .await;
+
+        let mut g = state.lock().unwrap();
+        match result {
+            Ok(targets) => {
+                g.targets.extend(targets);
+                g.ready.insert(station.id.clone());
+            }
+            Err(e) => {
+                tracing::warn!(station = %station.id, error = %e, "站点变更清单读取失败");
+                g.failed.insert(station.id.clone(), e.to_string());
+            }
+        }
+        g.preparers_done += 1;
+    }
+
     async fn max_stored_change_seq(&self, station_id: &str) -> Result<i64> {
         // list_changes 按 seq 升序，取末尾即最大；条目量在本地规模下可接受。
         let all = self.store.list_changes(station_id, 0).await?;
@@ -221,29 +320,72 @@ impl Engine {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// 当前可认领的站点集合及目标索引快照。
+    /// 处于等待期的站点不参与认领，等待期结束后会自动重新纳入。
+    async fn claim_scope(
+        &self,
+        state: &Mutex<RunState>,
+    ) -> (Vec<String>, HashMap<(String, String), (i64, i64)>) {
+        let (ids, targets) = {
+            let g = state.lock().unwrap();
+            (
+                g.ready.iter().cloned().collect::<Vec<_>>(),
+                g.targets.clone(),
+            )
+        };
+        let mut available = Vec::with_capacity(ids.len());
+        for id in ids {
+            if self.fetcher.is_available(&id).await {
+                available.push(id);
+            }
+        }
+        (available, targets)
+    }
+
     async fn worker(
         self: Arc<Self>,
         run_id: i64,
         entry: EntryPoint,
-        target_index: HashMap<(String, String), (i64, i64)>,
+        state: Arc<Mutex<RunState>>,
         station_by_id: HashMap<String, StationConfig>,
     ) -> Result<()> {
         let run = self.store.get_run(run_id).await?;
         loop {
-            // 认领一个待处理页面。
-            let claimed = self.store.claim_run_page(run_id).await?;
+            // 只从“清单已读完且不在等待期”的站点认领页面；其他站的积压或等待
+            // 不阻塞本站入库。所有站的清单读取都结束、且队列确实排空后才收工。
+            let (ids, target_index) = self.claim_scope(&state).await;
+            let claimed = self.store.claim_run_page_in(run_id, &ids).await?;
             let (station_id, page_key, depth, _attempts) = match claimed {
                 Some(v) => v,
                 None => {
-                    let counts = self.store.count_run_pages(run_id).await?;
-                    if counts.pending == 0 && counts.fetching == 0 {
-                        return Ok(()); // 本 worker 收工
+                    let (finished, pending_stations) = {
+                        let g = state.lock().unwrap();
+                        (
+                            g.preparers_done >= g.preparers_total,
+                            g.failed.keys().cloned().collect::<Vec<_>>(),
+                        )
+                    };
+                    if finished {
+                        // 清单失败的站点永远无法就绪：其 pending 页面直接按未处理收尾，
+                        // 否则工作线程会一直等一个不会到来的“就绪”。
+                        if !pending_stations.is_empty() {
+                            let mut left = self.store.pending_station_ids(run_id).await?;
+                            left.retain(|s| pending_stations.contains(s));
+                            if !left.is_empty() {
+                                self.store
+                                    .fail_pending_run_pages_for(run_id, &left, "站点变更清单未就绪")
+                                    .await?;
+                            }
+                        }
+                        let counts = self.store.count_run_pages(run_id).await?;
+                        if counts.pending == 0 && counts.fetching == 0 {
+                            return Ok(());
+                        }
                     }
-                    // 等其他 worker 入队新页面或释放任务。
+                    // 就绪站暂无待处理页面：等新页面入队或更多站点就绪。
                     let notified = self.wake.notified();
                     tokio::pin!(notified);
-                    let timeout = tokio::time::sleep(std::time::Duration::from_millis(50));
+                    let timeout = tokio::time::sleep(Duration::from_millis(20));
                     tokio::select! {
                         _ = notified => {}
                         _ = timeout => {}

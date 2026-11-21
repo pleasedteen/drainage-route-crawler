@@ -560,18 +560,30 @@ impl Store {
         Ok(())
     }
 
-    /// 原子认领一个 pending 页面（两种方言同一 SQL；Any 驱动负责占位符转换，
-    /// 并发 worker 间靠行锁串行化，不会重复认领）。
-    pub async fn claim_run_page(&self, run_id: i64) -> Result<Option<(String, String, i64, i64)>> {
-        let row = sqlx::query(
+    /// 仅在给定站点范围内认领一个 pending 页面。
+    ///
+    /// 变更清单尚未就绪、或站点正处于等待期的页面不会被认领，
+    /// 这样同轮其他站点已就绪的页面仍能继续推进，不被单站拖住。
+    pub async fn claim_run_page_in(
+        &self,
+        run_id: i64,
+        station_ids: &[String],
+    ) -> Result<Option<(String, String, i64, i64)>> {
+        if station_ids.is_empty() {
+            return Ok(None);
+        }
+        let placeholders = vec!["?"; station_ids.len()].join(", ");
+        let sql = format!(
             "UPDATE run_pages SET state = 'fetching', updated_at = ? \
-             WHERE id = (SELECT id FROM run_pages WHERE run_id = ? AND state = 'pending' LIMIT 1) \
-             RETURNING station_id, page_key, depth, attempts",
-        )
-        .bind(now_millis())
-        .bind(run_id)
-        .fetch_optional(&self.pool)
-        .await?;
+             WHERE id = (SELECT id FROM run_pages WHERE run_id = ? AND state = 'pending' \
+                         AND station_id IN ({placeholders}) LIMIT 1) \
+             RETURNING station_id, page_key, depth, attempts"
+        );
+        let mut q = sqlx::query(&sql).bind(now_millis()).bind(run_id);
+        for id in station_ids {
+            q = q.bind(id.as_str());
+        }
+        let row = q.fetch_optional(&self.pool).await?;
         Ok(row.map(|r| {
             (
                 r.try_get::<String, _>("station_id").unwrap_or_default(),
@@ -582,13 +594,63 @@ impl Store {
         }))
     }
 
+    /// 某轮还有哪些站点存在 pending 页面（不含正在抓取的）。
+    pub async fn pending_station_ids(&self, run_id: i64) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT station_id FROM run_pages WHERE run_id = ? AND state = 'pending'",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.try_get::<String, _>("station_id").unwrap_or_default())
+            .collect())
+    }
+
+    /// 清单最终未就绪的站点，其队列页面按失败收尾（轮次整体也按失败处理）。
+    pub async fn fail_pending_run_pages(&self, run_id: i64, err: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE run_pages SET state = 'failed', last_error = ?, updated_at = ? \
+             WHERE run_id = ? AND state IN ('pending','fetching')",
+        )
+        .bind(err)
+        .bind(now_millis())
+        .bind(run_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 仅对指定站点的 pending 页面按失败收尾。
+    pub async fn fail_pending_run_pages_for(
+        &self,
+        run_id: i64,
+        station_ids: &[String],
+        err: &str,
+    ) -> Result<()> {
+        if station_ids.is_empty() {
+            return Ok(());
+        }
+        let placeholders = vec!["?"; station_ids.len()].join(", ");
+        let sql = format!(
+            "UPDATE run_pages SET state = 'failed', last_error = ?, updated_at = ? \
+             WHERE run_id = ? AND state = 'pending' AND station_id IN ({placeholders})"
+        );
+        let mut q = sqlx::query(&sql).bind(err).bind(now_millis()).bind(run_id);
+        for id in station_ids {
+            q = q.bind(id.as_str());
+        }
+        q.execute(&self.pool).await?;
+        Ok(())
+    }
+
     pub async fn complete_run_page(
         &self,
         run_id: i64,
         station_id: &str,
         page_key: &str,
-    ) -> Result<()> {
-        sqlx::query(
+    ) -> Result<()> {        sqlx::query(
             "UPDATE run_pages SET state = 'done', attempts = attempts + 1, last_error = NULL, updated_at = ? \
              WHERE run_id = ? AND station_id = ? AND page_key = ?",
         )
