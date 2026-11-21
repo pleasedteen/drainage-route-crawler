@@ -1,6 +1,8 @@
 //! 本地模拟站点 HTTP 服务：
+//!
 //! - 端口 base_port     -> 分页 HTML 站 (station-a)
 //! - 端口 base_port + 1 -> JSON 站 (station-b)
+//!
 //! 两个服务共享同一份演示数据（同进程），分别监听。
 use std::net::SocketAddr;
 

@@ -96,6 +96,28 @@ CREATE TABLE run_pages (
 );
 CREATE INDEX ix_run_pages_state ON run_pages (run_id, state);
 
+-- 跨进程在途抓取租约：常驻服务与独立 CLI 共用采集库时的单飞（single-flight）协调。
+-- 同一 (站点, 页面, 抓取目标) 全局只允许一个持租者发出实际请求；
+-- 其他进程冷缓存命中同一目标时轮询等待，复用最终落库的 page_revisions。
+-- 持租进程退出后心跳停摆、expires_at 过期，等待者可通过一条条件 UPDATE 原子接手。
+CREATE TABLE IF NOT EXISTS fetch_leases (
+    id              __PK_AUTO__,
+    station_id      TEXT NOT NULL,
+    page_key        TEXT NOT NULL,
+    -- 'revision'：按明确修订号抓取；'seq'：按登记截止点取当时最新版本。
+    target_kind     TEXT NOT NULL,
+    target_value    INTEGER NOT NULL,
+    -- 持租者标识（进程号 + 本地序号），接手时整体换主。
+    owner_id        TEXT NOT NULL,
+    -- 'fetching' 在途；'done' 已落库（actual_revision 为实际修订）；
+    -- 'gone' 页面在目标点不存在（actual_revision 为 NULL）。
+    state           TEXT NOT NULL,
+    actual_revision INTEGER,
+    expires_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    UNIQUE (station_id, page_key, target_kind, target_value)
+);
+
 -- 每轮已核实的可达关系。
 CREATE TABLE reachable (
     id         __PK_AUTO__,

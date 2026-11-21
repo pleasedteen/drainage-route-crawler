@@ -92,6 +92,24 @@ impl Store {
                 .execute(&self.pool)
                 .await?;
         }
+        if current < 2 {
+            let pk = match self.kind {
+                DbKind::Sqlite => "INTEGER PRIMARY KEY AUTOINCREMENT",
+                DbKind::Postgres => "BIGSERIAL PRIMARY KEY",
+            };
+            let lease_ddl = include_str!("../schema/fetch_leases.sql").replace("__PK_AUTO__", pk);
+            for stmt in lease_ddl
+                .split(';')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                sqlx::query(stmt).execute(&self.pool).await?;
+            }
+            sqlx::query("INSERT INTO schema_versions (version, applied_at) VALUES (2, ?)")
+                .bind(now_millis())
+                .execute(&self.pool)
+                .await?;
+        }
         if self.kind == DbKind::Sqlite {
             // 写串行化后 WAL 即可；打开外键约束。
             for pragma in ["PRAGMA foreign_keys = ON", "PRAGMA journal_mode = WAL"] {
@@ -834,6 +852,244 @@ impl Store {
             })
             .collect())
     }
+
+    // ---------- 跨进程在途抓取租约（单飞 + 接手） ----------
+
+    /// 尝试获取某抓取目标的租约，三种结局（见 [`LeaseAcquire`]）。
+    ///
+    /// 关键并发语义全部由一条条件 UPSERT 承担：
+    /// - 行不存在 → 插入，本调用者持租；
+    /// - 行已为终态（done/gone）→ 不改动，走共享；
+    /// - 行在途但已过期（持租进程死亡/卡死）→ 原子换主，本调用者接手；
+    /// - 行在途且未过期 → 不改动，等待。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn acquire_fetch_lease(
+        &self,
+        station_id: &str,
+        page_key: &str,
+        target_kind: &str,
+        target_value: i64,
+        owner_id: &str,
+        ttl_ms: u64,
+    ) -> Result<LeaseAcquire> {
+        let now = now_millis();
+        let expires = now + ttl_ms as i64;
+        // SQLite 与 PostgreSQL 均支持带 WHERE 的 UPSERT；
+        // 终态行与未过期在途行不会被覆盖，过期在途行被原子接手。
+        sqlx::query(
+            "INSERT INTO fetch_leases \
+               (station_id, page_key, target_kind, target_value, owner_id, state, actual_revision, expires_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, 'fetching', NULL, ?, ?) \
+             ON CONFLICT(station_id, page_key, target_kind, target_value) DO UPDATE SET \
+               owner_id = excluded.owner_id, state = 'fetching', actual_revision = NULL, \
+               expires_at = excluded.expires_at, updated_at = excluded.updated_at \
+             WHERE fetch_leases.state = 'fetching' AND fetch_leases.expires_at <= ?",
+        )
+        .bind(station_id)
+        .bind(page_key)
+        .bind(target_kind)
+        .bind(target_value)
+        .bind(owner_id)
+        .bind(expires)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        // 分类只以读回的 owner/state 为准：UPSERT 的 rows_affected 在不同驱动下
+        // 对“插入 vs 更新”口径不一致，不能作为持租判断依据。
+        let lease = self
+            .get_fetch_lease(station_id, page_key, target_kind, target_value)
+            .await?
+            .ok_or_else(|| anyhow!("租约写入后读回失败"))?;
+        if lease.state != "fetching" {
+            return Ok(LeaseAcquire::Completed(lease));
+        }
+        if lease.owner_id == owner_id {
+            Ok(LeaseAcquire::Held(lease))
+        } else {
+            Ok(LeaseAcquire::Waiting(lease))
+        }
+    }
+
+    /// 读取某目标的当前租约（不存在返回 None）。
+    pub async fn get_fetch_lease(
+        &self,
+        station_id: &str,
+        page_key: &str,
+        target_kind: &str,
+        target_value: i64,
+    ) -> Result<Option<FetchLease>> {
+        let row = sqlx::query(
+            "SELECT id, station_id, page_key, target_kind, target_value, owner_id, state, \
+                    actual_revision, expires_at \
+             FROM fetch_leases \
+             WHERE station_id = ? AND page_key = ? AND target_kind = ? AND target_value = ?",
+        )
+        .bind(station_id)
+        .bind(page_key)
+        .bind(target_kind)
+        .bind(target_value)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| FetchLease {
+            id: r.try_get("id").unwrap_or_default(),
+            station_id: r.try_get("station_id").unwrap_or_default(),
+            page_key: r.try_get("page_key").unwrap_or_default(),
+            target_kind: r.try_get("target_kind").unwrap_or_default(),
+            target_value: r.try_get("target_value").unwrap_or_default(),
+            owner_id: r.try_get("owner_id").unwrap_or_default(),
+            state: r.try_get("state").unwrap_or_default(),
+            actual_revision: r.try_get("actual_revision").ok(),
+            expires_at: r.try_get("expires_at").unwrap_or_default(),
+        }))
+    }
+
+    /// 续租：只有“仍是本 owner 且仍在途”的租约才续期成功。
+    /// 返回 false 说明租约已被接手或已终态，持租者必须停止发布。
+    pub async fn heartbeat_fetch_lease(
+        &self,
+        lease_id: i64,
+        owner_id: &str,
+        ttl_ms: u64,
+    ) -> Result<bool> {
+        let now = now_millis();
+        let aff = sqlx::query(
+            "UPDATE fetch_leases SET expires_at = ?, updated_at = ? \
+             WHERE id = ? AND owner_id = ? AND state = 'fetching'",
+        )
+        .bind(now + ttl_ms as i64)
+        .bind(now)
+        .bind(lease_id)
+        .bind(owner_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(aff > 0)
+    }
+
+    /// 发布成功终态：落库修订号并置 done，等待者据此共享。
+    pub async fn complete_fetch_lease(
+        &self,
+        lease_id: i64,
+        owner_id: &str,
+        actual_revision: i64,
+    ) -> Result<()> {
+        let now = now_millis();
+        sqlx::query(
+            "UPDATE fetch_leases SET state = 'done', actual_revision = ?, expires_at = ?, updated_at = ? \
+             WHERE id = ? AND owner_id = ? AND state = 'fetching'",
+        )
+        .bind(actual_revision)
+        .bind(now)
+        .bind(now)
+        .bind(lease_id)
+        .bind(owner_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 发布 Gone 终态：目标点页面不存在（404/410），等待者不再重复抓。
+    pub async fn mark_gone_fetch_lease(&self, lease_id: i64, owner_id: &str) -> Result<()> {
+        let now = now_millis();
+        sqlx::query(
+            "UPDATE fetch_leases SET state = 'gone', actual_revision = NULL, expires_at = ?, updated_at = ? \
+             WHERE id = ? AND owner_id = ? AND state = 'fetching'",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(lease_id)
+        .bind(owner_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 可重试失败时主动放弃租约：只删自己仍在途的行，让其他等待者立即抢租，
+    /// 不必干等 TTL。已被接手/已终态的行不会被误删。
+    pub async fn release_fetch_lease(&self, lease_id: i64, owner_id: &str) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM fetch_leases WHERE id = ? AND owner_id = ? AND state = 'fetching'",
+        )
+        .bind(lease_id)
+        .bind(owner_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 启动时把已过期的在途租约标记为可立即接手（expires_at 归零）。
+    /// 未过期的在途租约说明另一活进程仍在抓，保持不动。
+    pub async fn reset_expired_fetch_leases(&self) -> Result<()> {
+        let now = now_millis();
+        sqlx::query(
+            "UPDATE fetch_leases SET expires_at = 0, updated_at = ? \
+             WHERE state = 'fetching' AND expires_at <= ?",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 清理超过保留期的终态租约（done/gone），避免租约表无限增长。
+    /// 在途（fetching）租约一律保留；终态的真正权威数据在 page_revisions，
+    /// 租约仅用于进程间汇合，过期后即可安全删除。
+    pub async fn prune_terminal_fetch_leases(&self, retain_ms: u64) -> Result<u64> {
+        let cutoff = now_millis().saturating_sub(retain_ms as i64);
+        let aff =
+            sqlx::query("DELETE FROM fetch_leases WHERE state <> 'fetching' AND updated_at < ?")
+                .bind(cutoff)
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+        Ok(aff)
+    }
+
+    /// 按页面读取其当前租约（诊断/演示用，取任意目标键的最新一条）。
+    pub async fn get_lease_for_page(&self, page_key: &str) -> Result<Option<FetchLease>> {
+        let row = sqlx::query(
+            "SELECT id, station_id, page_key, target_kind, target_value, owner_id, state, \
+                    actual_revision, expires_at \
+             FROM fetch_leases WHERE page_key = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(page_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| FetchLease {
+            id: r.try_get("id").unwrap_or_default(),
+            station_id: r.try_get("station_id").unwrap_or_default(),
+            page_key: r.try_get("page_key").unwrap_or_default(),
+            target_kind: r.try_get("target_kind").unwrap_or_default(),
+            target_value: r.try_get("target_value").unwrap_or_default(),
+            owner_id: r.try_get("owner_id").unwrap_or_default(),
+            state: r.try_get("state").unwrap_or_default(),
+            actual_revision: r.try_get("actual_revision").ok(),
+            expires_at: r.try_get("expires_at").unwrap_or_default(),
+        }))
+    }
+
+    /// 重复修订行数（同一 站点/页面/修订 出现多条），诊断共享缓存是否被破坏。
+    pub async fn count_duplicate_revisions(&self) -> Result<i64> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS c FROM (SELECT 1 FROM page_revisions \
+             GROUP BY station_id, page_key, revision HAVING COUNT(*) > 1)",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.try_get("c")?)
+    }
+
+    /// 处于指定状态的租约数量（诊断用）。
+    pub async fn count_leases_in_state(&self, state: &str) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) AS c FROM fetch_leases WHERE state = ?")
+            .bind(state)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get("c")?)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -843,6 +1099,32 @@ pub struct RunPageCounts {
     pub pending: i64,
     pub fetching: i64,
     pub failed: i64,
+}
+
+/// 跨进程抓取租约的一行。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FetchLease {
+    pub id: i64,
+    pub station_id: String,
+    pub page_key: String,
+    /// "revision" | "seq"
+    pub target_kind: String,
+    pub target_value: i64,
+    pub owner_id: String,
+    /// "fetching" | "done" | "gone"
+    pub state: String,
+    pub actual_revision: Option<i64>,
+    pub expires_at: i64,
+}
+
+/// 抢租结果。
+pub enum LeaseAcquire {
+    /// 本调用者成为持租者：必须负责实际抓取、心跳与终态发布。
+    Held(FetchLease),
+    /// 其他进程正在抓取且租约未过期：等待终态后共享，不发请求。
+    Waiting(FetchLease),
+    /// 抓取已有终态（done/gone）：直接共享，不发请求。
+    Completed(FetchLease),
 }
 
 pub fn map_err(e: sqlx::Error) -> anyhow::Error {

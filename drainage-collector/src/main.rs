@@ -51,6 +51,21 @@ enum Command {
     Entries,
     /// 列出站点。
     Stations,
+    /// 采集库诊断（跨进程单飞演示与排障用，只读）。
+    Db {
+        #[command(subcommand)]
+        what: DbQuery,
+    },
+}
+
+#[derive(Subcommand)]
+enum DbQuery {
+    /// 查看某页面当前抓取租约（owner/state/过期时间）。
+    Lease { page_key: String },
+    /// 统计重复修订行数（应为 0）。
+    DupRevisions,
+    /// 统计处于指定状态的租约数，如 fetching / done / gone。
+    LeaseCount { state: String },
 }
 
 const DEFAULT_CONFIG: &str = include_str!("../config/local.toml");
@@ -143,6 +158,23 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::Db { what } => match what {
+            DbQuery::Lease { page_key } => {
+                match store.get_lease_for_page(&page_key).await? {
+                    Some(l) => println!("{}", serde_json::to_string_pretty(&l)?),
+                    None => println!("null"),
+                }
+                Ok(())
+            }
+            DbQuery::DupRevisions => {
+                println!("{}", store.count_duplicate_revisions().await?);
+                Ok(())
+            }
+            DbQuery::LeaseCount { state } => {
+                println!("{}", store.count_leases_in_state(&state).await?);
+                Ok(())
+            }
+        },
     }
 }
 

@@ -1,0 +1,45 @@
+# 跨进程单飞/接手端到端演示配置：
+# 真实 HTTP 模拟站（mock-server）+ 文件型 SQLite，两个独立进程（serve 与 CLI）
+# 共用同一个采集库与同一份模拟站，便于数实际请求并验证 kill 后接手。
+[server]
+listen = "127.0.0.1:8090"
+
+[database]
+# 演示脚本使用独立数据库文件，避免与本地默认 data/drainage.db 互相干扰。
+url = "sqlite://data/single_flight.db"
+
+# 不配置 [mock] 段：走真实 HTTP 客户端，请求真正经过网络与站点限速。
+
+# 租约节奏调短，便于演示“抓取方退出后等待者在秒级接手”。
+# 由环境变量 DRAINAGE_LEASE_TTL_MS / DRAINAGE_LEASE_HEARTBEAT_MS 读取。
+
+[[stations]]
+id = "station-a"
+name = "城东养护站"
+base_url = "http://127.0.0.1:9100"
+format = "html"
+min_interval_ms = 20
+max_inflight = 2
+watermark_seq = 0
+
+[[stations]]
+id = "station-b"
+name = "河西养护站"
+base_url = "http://127.0.0.1:9101"
+format = "json"
+min_interval_ms = 20
+max_inflight = 2
+watermark_seq = 0
+
+# 入口 1：a0 全图入口（常驻服务使用）。
+[[entry_points]]
+station_id = "station-a"
+page_key = "a0"
+label = "城东入流口"
+
+# 入口 2：a1 下游入口（独立 CLI 使用），与入口 1 的下游大面积重叠，
+# 因而两进程会同时撞上同一批冷缓存页面。
+[[entry_points]]
+station_id = "station-a"
+page_key = "a1"
+label = "A1检查井入口"

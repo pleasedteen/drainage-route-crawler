@@ -5,7 +5,9 @@
 //! - 演示时用 [`router`] 起 axum HTTP 服务，行为与生产站点一致
 //!   （分页变更清单、按修订取页面、临时失败与 Retry-After 注入）。
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -21,6 +23,58 @@ use serde_json::json;
 
 use crate::fetch::{FetchedPage, PageClient, PageFetchError};
 use crate::model::{ChangeLogEntry, FacilityInfo, LinkRef, StationConfig};
+
+/// 页面阻塞闸门：前 `waiters` 个到达该页的请求在此等待，`release` 后全部放行。
+/// 用于在真实 HTTP 链路里制造“响应很慢”的在途窗口，验证跨进程单飞。
+#[derive(Debug)]
+pub struct HoldGate {
+    waiters: AtomicU64,
+    sem: tokio::sync::Semaphore,
+}
+
+impl HoldGate {
+    pub fn new(waiters: u64) -> Self {
+        Self {
+            waiters: AtomicU64::new(waiters),
+            sem: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    /// 前 waiters 次调用挂起；release 之后（或名额耗尽后）直接通过。
+    pub async fn pass(&self) {
+        if self.waiters.fetch_saturating_sub() > 0 {
+            // 关闭信号量会让所有 acquire 立即返回 Err，达到一次性广播放行。
+            let _ = self.sem.acquire().await;
+        }
+    }
+
+    pub fn release(&self) {
+        self.sem.close();
+    }
+}
+
+trait AtomicSaturating {
+    fn fetch_saturating_sub(&self) -> u64;
+}
+
+impl AtomicSaturating for AtomicU64 {
+    fn fetch_saturating_sub(&self) -> u64 {
+        let mut cur = self.load(Ordering::SeqCst);
+        loop {
+            let next = cur.saturating_sub(1);
+            match self.compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(v) => return v,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+
+/// 单页命中计数 +1。一次性取得写锁后在同一守卫内查改，避免重入死锁。
+fn bump_per_page_hit(counters: &Arc<RwLock<HashMap<String, u64>>>, page_key: &str) {
+    let mut g = counters.write().unwrap();
+    *g.entry(page_key.to_string()).or_insert(0) += 1;
+}
 
 /// 页面的一个历史修订。
 #[derive(Debug, Clone)]
@@ -44,6 +98,17 @@ pub struct MockStation {
     /// 剩余 Retry-After 注入次数。
     pub retry_after_hits: u32,
     pub retry_after_secs: u64,
+    /// 页面请求计数（实际到达模拟站的请求，缓存命中不会到达这里）。
+    pub page_requests: Arc<AtomicU64>,
+    /// 当前在途页面请求数与历史峰值，用来验证站点在途上限。
+    pub inflight: Arc<AtomicU64>,
+    pub inflight_peak: Arc<AtomicU64>,
+    /// 每页固定延迟（毫秒），制造慢响应。
+    pub delays_ms: Arc<RwLock<HashMap<String, u64>>>,
+    /// 每页阻塞闸门，配合 release 制造可控在途窗口。
+    pub holds: Arc<RwLock<HashMap<String, Arc<HoldGate>>>>,
+    /// 单页请求计数。
+    pub per_page_hits: Arc<RwLock<HashMap<String, u64>>>,
 }
 
 impl MockStation {
@@ -56,6 +121,12 @@ impl MockStation {
             transient_failures: 0,
             retry_after_hits: 0,
             retry_after_secs: 1,
+            page_requests: Arc::new(AtomicU64::new(0)),
+            inflight: Arc::new(AtomicU64::new(0)),
+            inflight_peak: Arc::new(AtomicU64::new(0)),
+            delays_ms: Arc::new(RwLock::new(HashMap::new())),
+            holds: Arc::new(RwLock::new(HashMap::new())),
+            per_page_hits: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -150,6 +221,65 @@ impl MockWorld {
         if let Some(s) = g.get_mut(id) {
             f(s);
         }
+    }
+
+    /// 让某页面的每次请求固定延迟，制造“响应很慢”的在途窗口。
+    pub fn set_page_delay_ms(&self, station_id: &str, page_key: &str, delay_ms: u64) {
+        self.with_station(station_id, |s| {
+            s.delays_ms
+                .write()
+                .unwrap()
+                .insert(page_key.to_string(), delay_ms);
+        });
+    }
+
+    /// 让某页面前 `waiters` 个请求阻塞，直到调用 release_page_hold。
+    pub fn hold_page(&self, station_id: &str, page_key: &str, waiters: u64) {
+        let gate = Arc::new(HoldGate::new(waiters));
+        self.with_station(station_id, |s| {
+            s.holds.write().unwrap().insert(page_key.to_string(), gate);
+        });
+    }
+
+    /// 放行某页面上所有阻塞中的请求。
+    pub fn release_page_hold(&self, station_id: &str, page_key: &str) {
+        if let Some(s) = self.get_station(station_id) {
+            if let Some(gate) = s.holds.read().unwrap().get(page_key).cloned() {
+                gate.release();
+            }
+        }
+    }
+
+    /// 某站实际收到的页面请求总数（缓存/单飞命中不会产生请求）。
+    pub fn page_request_count(&self, station_id: &str) -> u64 {
+        self.get_station(station_id)
+            .map(|s| s.page_requests.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
+    /// 全站页面请求总数。
+    pub fn total_page_requests(&self) -> u64 {
+        self.inner
+            .read()
+            .unwrap()
+            .values()
+            .map(|s| s.page_requests.load(Ordering::SeqCst))
+            .sum()
+    }
+
+    /// 某站在途请求历史峰值，用来核对 max_inflight 限速。
+    pub fn inflight_peak(&self, station_id: &str) -> u64 {
+        self.get_station(station_id)
+            .map(|s| s.inflight_peak.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
+    /// 单页实际收到的请求次数（验证同页同修订只发一次）。
+    pub fn page_hits(&self, station_id: &str, page_key: &str) -> u64 {
+        // 页面计数统一存在按页计数器里（serve 时写入）。
+        self.get_station(station_id)
+            .and_then(|s| s.per_page_hits.read().unwrap().get(page_key).copied())
+            .unwrap_or(0)
     }
 
     /// 构造标准演示图：跨站路线、汇合与回流成环，外加一轮后续修订。
@@ -305,7 +435,7 @@ impl MockPageClient {
         self.requests.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn serve_page(
+    async fn serve_page(
         &self,
         station: &StationConfig,
         page_key: &str,
@@ -317,6 +447,41 @@ impl MockPageClient {
             .world
             .get_station(&station.id)
             .ok_or_else(|| PageFetchError::Fatal(format!("未知站点 {}", station.id)))?;
+
+        // 在途计数：先于故障注入，反映真实占用的在途额度。
+        let inflight = st.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+        st.inflight_peak.fetch_max(inflight, Ordering::SeqCst);
+        st.page_requests.fetch_add(1, Ordering::SeqCst);
+        bump_per_page_hit(&st.per_page_hits, page_key);
+        // 慢响应与阻塞闸门：用于验证“响应很慢也只发一次请求”。
+        let delay = st
+            .delays_ms
+            .read()
+            .unwrap()
+            .get(page_key)
+            .copied()
+            .unwrap_or(0);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+        let gate = st.holds.read().unwrap().get(page_key).cloned();
+        if let Some(gate) = gate {
+            gate.pass().await;
+        }
+        let result = self
+            .serve_page_inner(&mut st, station, page_key, target)
+            .await;
+        st.inflight.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+
+    async fn serve_page_inner(
+        &self,
+        st: &mut MockStation,
+        station: &StationConfig,
+        page_key: &str,
+        target: crate::fetch::FetchTarget,
+    ) -> std::result::Result<FetchedPage, PageFetchError> {
         if st.transient_failures > 0 {
             st.transient_failures -= 1;
             self.world.with_station(&station.id, |s| {
@@ -355,7 +520,7 @@ impl PageClient for MockPageClient {
         page_key: &str,
         target: crate::fetch::FetchTarget,
     ) -> std::result::Result<FetchedPage, PageFetchError> {
-        self.serve_page(station, page_key, target)
+        self.serve_page(station, page_key, target).await
     }
 
     async fn fetch_state(&self, station: &StationConfig) -> Result<i64> {
@@ -466,6 +631,10 @@ pub fn router(world: MockWorld, station_id: &'static str) -> Router {
         .route("/pages/:key", get(page_handler))
         .route("/inject/fail", post(inject_fail_handler))
         .route("/inject/retry-after", post(inject_retry_handler))
+        .route("/inject/delay", post(inject_delay_handler))
+        .route("/inject/hold", post(inject_hold_handler))
+        .route("/inject/release", post(release_hold_handler))
+        .route("/requests", get(requests_handler))
         .with_state((world, station_id))
 }
 
@@ -520,6 +689,35 @@ async fn page_handler(
         max_inflight: 1,
         watermark_seq: 0,
     };
+
+    // 在途与请求计数（真实到达模拟站的请求）。
+    let inflight = st.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+    st.inflight_peak.fetch_max(inflight, Ordering::SeqCst);
+    st.page_requests.fetch_add(1, Ordering::SeqCst);
+    bump_per_page_hit(&st.per_page_hits, &key);
+    // 慢响应/阻塞闸门，制造可观测的在途窗口。
+    let delay = st.delays_ms.read().unwrap().get(&key).copied().unwrap_or(0);
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
+    let gate = st.holds.read().unwrap().get(&key).cloned();
+    if let Some(gate) = gate {
+        gate.pass().await;
+    }
+
+    let result = page_handler_inner(&world, sid, &st, &cfg, &key, &q).await;
+    st.inflight.fetch_sub(1, Ordering::SeqCst);
+    result
+}
+
+async fn page_handler_inner(
+    world: &MockWorld,
+    sid: &str,
+    st: &MockStation,
+    cfg: &StationConfig,
+    key: &str,
+    q: &PageQuery,
+) -> Result<axum::response::Response, StatusCode> {
     if st.transient_failures > 0 {
         world.with_station(sid, |s| {
             s.transient_failures = s.transient_failures.saturating_sub(1)
@@ -538,15 +736,15 @@ async fn page_handler(
             .into_response());
     }
     let v = match (q.revision, q.as_of) {
-        (Some(rev), _) => st.version_at(&key, Some(rev)),
-        (None, Some(seq)) => st.version_as_of(&key, seq),
-        (None, None) => st.version_at(&key, None),
+        (Some(rev), _) => st.version_at(key, Some(rev)),
+        (None, Some(seq)) => st.version_as_of(key, seq),
+        (None, None) => st.version_at(key, None),
     }
     .ok_or(StatusCode::NOT_FOUND)?;
     if v.removed {
         return Err(StatusCode::GONE);
     }
-    let (ct, body) = render(&cfg, &key, v);
+    let (ct, body) = render(cfg, key, v);
     Ok(match ct.as_str() {
         "text/html" => Html(body).into_response(),
         _ => AxumJson(serde_json::from_str::<serde_json::Value>(&body).unwrap()).into_response(),
@@ -572,4 +770,56 @@ async fn inject_retry_handler(
         s.retry_after_secs = secs;
     });
     AxumJson(json!({"ok": true, "retry_after_next_request_secs": secs}))
+}
+
+#[derive(serde::Deserialize)]
+struct PageInjectQuery {
+    page: String,
+    #[serde(default)]
+    delay_ms: Option<u64>,
+    #[serde(default)]
+    waiters: Option<u64>,
+}
+
+async fn inject_delay_handler(
+    State((world, sid)): State<HttpState>,
+    Query(q): Query<PageInjectQuery>,
+) -> AxumJson<serde_json::Value> {
+    let delay = q.delay_ms.unwrap_or(0);
+    world.set_page_delay_ms(sid, &q.page, delay);
+    AxumJson(json!({"ok": true, "station_id": sid, "page": q.page, "delay_ms": delay}))
+}
+
+async fn inject_hold_handler(
+    State((world, sid)): State<HttpState>,
+    Query(q): Query<PageInjectQuery>,
+) -> AxumJson<serde_json::Value> {
+    let waiters = q.waiters.unwrap_or(1);
+    world.hold_page(sid, &q.page, waiters);
+    AxumJson(json!({"ok": true, "station_id": sid, "page": q.page, "waiters": waiters}))
+}
+
+async fn release_hold_handler(
+    State((world, sid)): State<HttpState>,
+    Query(q): Query<PageInjectQuery>,
+) -> AxumJson<serde_json::Value> {
+    world.release_page_hold(sid, &q.page);
+    AxumJson(json!({"ok": true, "station_id": sid, "page": q.page, "released": true}))
+}
+
+async fn requests_handler(State((world, sid)): State<HttpState>) -> AxumJson<serde_json::Value> {
+    let st = match world.get_station(sid) {
+        Some(s) => s,
+        None => {
+            return AxumJson(
+                json!({"station_id": sid, "page_requests": 0, "inflight_peak": 0, "per_page": {}}),
+            )
+        }
+    };
+    AxumJson(json!({
+        "station_id": sid,
+        "page_requests": st.page_requests.load(Ordering::SeqCst),
+        "inflight_peak": st.inflight_peak.load(Ordering::SeqCst),
+        "per_page": st.per_page_hits.read().unwrap().clone(),
+    }))
 }
