@@ -1,6 +1,10 @@
 //! 抓取层：每站独立的发起频率 / 在途并发闸门、失败退避重试、
 //! 收到站点等待要求（Retry-After）后暂停该站、其他站不受影响。
+//!
+//! 值班员确认暂停某个轮次时，通过 [`PauseToken`] 只中断该轮次的抓取，
+//! 站点控制器（频率、在途、Retry-After 暂停）仍按原节奏服务其他轮次。
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,6 +31,8 @@ pub enum PageFetchError {
     /// 永久失败（如 404/410 页面已移除）：本轮不再重试。
     Gone,
     Fatal(String),
+    /// 该轮次已被值班员确认暂停：不再发起请求，页面留待继续时处理。
+    Paused,
 }
 
 impl std::fmt::Display for PageFetchError {
@@ -36,11 +42,51 @@ impl std::fmt::Display for PageFetchError {
             PageFetchError::RetryAfter(d) => write!(f, "站点要求等待 {}ms", d.as_millis()),
             PageFetchError::Gone => write!(f, "页面已移除 (404/410)"),
             PageFetchError::Fatal(s) => write!(f, "永久失败: {s}"),
+            PageFetchError::Paused => write!(f, "轮次已暂停"),
         }
     }
 }
 
 impl std::error::Error for PageFetchError {}
+
+/// 某个轮次的暂停信号。每个轮次一个，与站点节奏控制器完全独立：
+/// 暂停轮次 A 不会让共用站点的轮次 B 停下来。
+#[derive(Clone, Default)]
+pub struct PauseToken {
+    paused: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl PauseToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 确认暂停：置位并唤醒所有在退避/排队/请求中的等待者。
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    /// 等到该轮次被暂停为止；未暂停时永久挂起。可安全地放进 `select!`。
+    pub async fn wait_paused(&self) {
+        loop {
+            // 先登记通知再检查标志，避免错过置位与唤醒之间的竞态。
+            let notified = self.notify.notified();
+            if self.is_paused() {
+                return;
+            }
+            notified.await;
+            if self.is_paused() {
+                return;
+            }
+        }
+    }
+}
 
 /// 抓取目标：明确修订号，或按登记截止点取当时最新版本。
 #[derive(Debug, Clone, Copy)]
@@ -93,23 +139,31 @@ impl StationController {
     }
 
     /// 取得在途许可并满足最小发起间隔；若站点被要求暂停则等待到恢复时刻。
-    async fn acquire(self: &Arc<Self>) -> tokio::sync::SemaphorePermit<'_> {
+    /// 返回 `None` 表示该轮次已被值班员确认暂停，应立即放弃本次抓取
+    /// （站点控制器自身的节奏与暂停状态不受影响）。
+    async fn acquire(
+        self: &Arc<Self>,
+        pause: &PauseToken,
+    ) -> Option<tokio::sync::SemaphorePermit<'_>> {
         loop {
-            // 先排队拿在途额度。
-            let permit = self
-                .inflight
-                .acquire()
-                .await
-                .expect("semaphore never closed");
-            // 站点暂停期间不占在途额度。
-            let pause = *self.paused_until.lock().await;
-            if let Some(until) = pause {
+            if pause.is_paused() {
+                return None;
+            }
+            // 先排队拿在途额度；等待期间可被轮次暂停打断。
+            let permit = tokio::select! {
+                p = self.inflight.acquire() => p.expect("semaphore never closed"),
+                _ = pause.wait_paused() => return None,
+            };
+            // 站点暂停期间不占在途额度（这是站点的节奏，不是轮次的暂停）。
+            let pause_until = *self.paused_until.lock().await;
+            if let Some(until) = pause_until {
                 let now = Instant::now();
                 if until > now {
                     drop(permit);
                     tokio::select! {
                         _ = tokio::time::sleep_until(tokio::time::Instant::from_std(until)) => {}
                         _ = self.wake.notified() => {}
+                        _ = pause.wait_paused() => return None,
                     }
                     continue;
                 }
@@ -128,10 +182,13 @@ impl StationController {
             };
             if let Some(w) = wait {
                 drop(permit);
-                tokio::time::sleep(w).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(w) => {}
+                    _ = pause.wait_paused() => return None,
+                }
                 continue;
             }
-            return permit;
+            return Some(permit);
         }
     }
 
@@ -273,18 +330,30 @@ impl Fetcher {
             .clone()
     }
 
-    /// 带退避重试地抓页面。收到 Retry-After 时只暂停对应站点。
+    /// 带退避重试地抓页面。收到 Retry-After 时只暂停对应站点；
+    /// 该轮次被值班员确认暂停时立刻返回 [`PageFetchError::Paused`]，不再发新请求。
     pub async fn fetch_page(
         &self,
         station: &StationConfig,
         page_key: &str,
         target: FetchTarget,
+        pause: &PauseToken,
     ) -> std::result::Result<FetchedPage, PageFetchError> {
         let ctl = self.controller(station).await;
         let mut attempt: u32 = 0;
         loop {
+            if pause.is_paused() {
+                return Err(PageFetchError::Paused);
+            }
             attempt += 1;
-            let _permit = ctl.acquire().await;
+            let _permit = match ctl.acquire(pause).await {
+                Some(p) => p,
+                None => return Err(PageFetchError::Paused),
+            };
+            // 等待在途额度期间可能已被暂停，发请求前最后确认一次。
+            if pause.is_paused() {
+                return Err(PageFetchError::Paused);
+            }
             match self.client.fetch_page(station, page_key, target).await {
                 Ok(page) => return Ok(page),
                 Err(PageFetchError::Gone) => return Err(PageFetchError::Gone),
@@ -298,7 +367,10 @@ impl Fetcher {
                     // 只暂停该站；其他站的控制器不受影响。
                     drop(_permit);
                     ctl.pause_for(d).await;
-                    tokio::time::sleep(d).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(d) => {}
+                        _ = pause.wait_paused() => return Err(PageFetchError::Paused),
+                    }
                 }
                 Err(PageFetchError::Transient(msg)) => {
                     if attempt >= MAX_ATTEMPTS {
@@ -313,8 +385,13 @@ impl Fetcher {
                         (rand::random::<u64>() % 40).min(base.as_millis() as u64),
                     );
                     drop(_permit);
-                    tokio::time::sleep(base + jitter).await;
+                    // 站点正在退避时同样允许确认暂停。
+                    tokio::select! {
+                        _ = tokio::time::sleep(base + jitter) => {}
+                        _ = pause.wait_paused() => return Err(PageFetchError::Paused),
+                    }
                 }
+                Err(PageFetchError::Paused) => return Err(PageFetchError::Paused),
             }
         }
     }
@@ -327,18 +404,34 @@ impl Fetcher {
     }
 
     /// 带重试地读取状态截止点。
-    pub async fn fetch_state(&self, station: &StationConfig) -> Result<i64> {
+    pub async fn fetch_state(
+        &self,
+        station: &StationConfig,
+        pause: &PauseToken,
+    ) -> Result<i64> {
         let ctl = self.controller(station).await;
         let mut attempt = 0;
         loop {
+            if pause.is_paused() {
+                return Err(anyhow::anyhow!(PageFetchError::Paused));
+            }
             attempt += 1;
-            let _permit = ctl.acquire().await;
+            let _permit = match ctl.acquire(pause).await {
+                Some(p) => p,
+                None => return Err(anyhow::anyhow!(PageFetchError::Paused)),
+            };
+            if pause.is_paused() {
+                return Err(anyhow::anyhow!(PageFetchError::Paused));
+            }
             match self.client.fetch_state(station).await {
                 Ok(v) => return Ok(v),
                 Err(e) if attempt >= MAX_ATTEMPTS => return Err(e),
                 Err(_) => {
                     drop(_permit);
-                    tokio::time::sleep(Duration::from_millis(100) * attempt).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(100) * attempt) => {}
+                        _ = pause.wait_paused() => return Err(anyhow::anyhow!(PageFetchError::Paused)),
+                    }
                 }
             }
         }
@@ -350,21 +443,34 @@ impl Fetcher {
         station: &StationConfig,
         after_seq: i64,
         cutoff: i64,
+        pause: &PauseToken,
     ) -> Result<Vec<ChangeLogEntry>> {
         let ctl = self.controller(station).await;
         let mut cursor = after_seq;
         let mut out = Vec::new();
         loop {
+            if pause.is_paused() {
+                return Err(anyhow::anyhow!(PageFetchError::Paused));
+            }
             let mut attempt = 0;
             let (entries, next) = loop {
                 attempt += 1;
-                let _permit = ctl.acquire().await;
+                let _permit = match ctl.acquire(pause).await {
+                    Some(p) => p,
+                    None => return Err(anyhow::anyhow!(PageFetchError::Paused)),
+                };
+                if pause.is_paused() {
+                    return Err(anyhow::anyhow!(PageFetchError::Paused));
+                }
                 match self.client.fetch_changes(station, cursor).await {
                     Ok(v) => break v,
                     Err(e) if attempt >= MAX_ATTEMPTS => return Err(e),
                     Err(_) => {
                         drop(_permit);
-                        tokio::time::sleep(Duration::from_millis(100) * attempt).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(100) * attempt) => {}
+                            _ = pause.wait_paused() => return Err(anyhow::anyhow!(PageFetchError::Paused)),
+                        }
                     }
                 }
             };

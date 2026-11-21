@@ -81,6 +81,8 @@ impl RunMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunStatus {
     Running,
+    /// 值班员确认暂停：停在当前进度，等待继续。
+    Paused,
     Succeeded,
     Failed,
 }
@@ -89,6 +91,7 @@ impl RunStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             RunStatus::Running => "running",
+            RunStatus::Paused => "paused",
             RunStatus::Succeeded => "succeeded",
             RunStatus::Failed => "failed",
         }
@@ -97,8 +100,14 @@ impl RunStatus {
         match s {
             "succeeded" => RunStatus::Succeeded,
             "failed" => RunStatus::Failed,
+            "paused" => RunStatus::Paused,
             _ => RunStatus::Running,
         }
+    }
+
+    /// 未走完、会占用原入口的工作状态（同入口不得另起轮次）。
+    pub fn is_open(self) -> bool {
+        matches!(self, RunStatus::Running | RunStatus::Paused)
     }
 }
 
@@ -118,6 +127,8 @@ pub struct Run {
     /// site_id -> 本轮截止登记序号
     pub watermarks: BTreeMap<String, i64>,
     pub error: Option<String>,
+    /// 值班员确认暂停的时刻（仅 status = paused 时有值，重启后仍保留）。
+    pub paused_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -191,6 +202,8 @@ pub struct RunProgress {
     pub failed: i64,
     pub reachable: i64,
     pub error: Option<String>,
+    /// 已确认暂停的时刻（status = "paused" 时非空），便于查询接口看出暂停。
+    pub paused_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }

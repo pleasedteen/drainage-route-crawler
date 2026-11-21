@@ -69,6 +69,8 @@ CREATE TABLE change_log (
 CREATE INDEX ix_change_station_seq ON change_log (station_id, seq);
 
 -- 采集轮次。watermarks 为 JSON：轮次开始时固化的各站登记截止点。
+-- status: running | paused | succeeded | failed。
+-- paused_at（值班员确认暂停的时刻）由迁移 v2 追加，见 store::init_schema。
 CREATE TABLE runs (
     id         __PK_AUTO__,
     entry_id   INTEGER NOT NULL,

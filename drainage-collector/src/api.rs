@@ -28,6 +28,8 @@ pub fn router(state: AppState) -> Router {
         .route("/runs", get(list_runs))
         .route("/runs/start", post(start_run))
         .route("/runs/:run_id", get(get_run))
+        .route("/runs/:run_id/pause", post(pause_run))
+        .route("/runs/:run_id/resume", post(resume_run))
         .route("/runs/:run_id/progress", get(run_progress))
         .route("/runs/:run_id/reachable", get(run_reachable))
         .route("/entries/:entry_id/reachable", get(entry_reachable))
@@ -124,9 +126,56 @@ async fn get_run(
         "status": run.status.as_str(),
         "watermarks": run.watermarks,
         "error": run.error,
+        "paused_at": run.paused_at,
         "created_at": run.created_at,
         "updated_at": run.updated_at,
     })))
+}
+
+/// 确认暂停：轮次停在当前进度，不再发新请求，已核实结果不变。
+async fn pause_run(
+    State(s): State<AppState>,
+    Path(run_id): Path<i64>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    match s.engine.pause_run(run_id).await {
+        Ok(()) => {
+            // pause_run 已在内部等执行任务停下（在途页面放回队列），暂停可见。
+            let run = s
+                .store
+                .get_run(run_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            Ok(Json(serde_json::json!({
+                "run_id": run.id,
+                "status": run.status.as_str(),
+                "paused_at": run.paused_at,
+            })))
+        }
+        Err(e) => Err((StatusCode::CONFLICT, e.to_string())),
+    }
+}
+
+/// 继续原轮次：沿用原 ID 与各站截止点，已核实结果保留。
+async fn resume_run(
+    State(s): State<AppState>,
+    Path(run_id): Path<i64>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    match s.engine.resume_run(run_id).await {
+        Ok(Some(id)) => {
+            let run = s
+                .store
+                .get_run(id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            Ok(Json(serde_json::json!({
+                "run_id": run.id,
+                "status": run.status.as_str(),
+                "watermarks": run.watermarks,
+            })))
+        }
+        Ok(None) => Err((StatusCode::CONFLICT, "轮次未能继续".into())),
+        Err(e) => Err((StatusCode::CONFLICT, e.to_string())),
+    }
 }
 
 async fn run_progress(

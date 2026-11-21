@@ -41,6 +41,15 @@ enum Command {
         #[arg(long)]
         wait: bool,
     },
+    /// 确认暂停一个进行中的轮次（停在当前进度，重启后仍保持暂停）。
+    Pause { run_id: i64 },
+    /// 继续已暂停的轮次（沿用原轮次与截止点）。
+    Resume {
+        run_id: i64,
+        /// 继续后等待轮次结束。
+        #[arg(long)]
+        wait: bool,
+    },
     /// 查询轮次进度。
     Progress { run_id: i64 },
     /// 查询某轮次已核实可达设施。
@@ -108,6 +117,22 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Pause { run_id } => {
+            engine.pause_run(run_id).await?;
+            let p = engine.progress(run_id).await?;
+            println!("{}", serde_json::to_string_pretty(&p)?);
+            Ok(())
+        }
+        Command::Resume { run_id, wait } => {
+            match engine.resume_run(run_id).await? {
+                Some(id) => println!("已继续轮次 run_id={id}"),
+                None => println!("轮次 {run_id} 未能继续"),
+            }
+            if wait {
+                wait_for_finish(&engine, run_id).await?;
+            }
+            Ok(())
+        }
         Command::Progress { run_id } => {
             let p = engine.progress(run_id).await?;
             println!("{}", serde_json::to_string_pretty(&p)?);
@@ -151,6 +176,9 @@ async fn wait_for_finish(engine: &Engine, run_id: i64) -> Result<()> {
         let p = engine.progress(run_id).await?;
         if p.status != "running" {
             println!("轮次结束：status={} reachable={}", p.status, p.reachable);
+            if p.status == "paused" {
+                return Ok(());
+            }
             if p.status == "failed" {
                 std::process::exit(2);
             }

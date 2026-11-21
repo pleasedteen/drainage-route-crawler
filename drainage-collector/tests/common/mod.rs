@@ -37,6 +37,26 @@ pub async fn wait_run(engine: &Engine, run_id: i64) -> drainage_collector::model
     }
 }
 
+/// 等到出现满足条件的一次进度快照（带超时）。
+pub async fn wait_progress(
+    engine: &Engine,
+    run_id: i64,
+    mut pred: impl FnMut(&drainage_collector::model::RunProgress) -> bool,
+) -> drainage_collector::model::RunProgress {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let p = engine.progress(run_id).await.unwrap();
+        if pred(&p) {
+            return p;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等待轮次 {run_id} 进度条件超时: {p:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 pub async fn fresh_engine_for_store(store: Store, world: MockWorld) -> Arc<Engine> {
     let client = Arc::new(MockPageClient::new(world));
     let fetcher = Arc::new(Fetcher::new(client));

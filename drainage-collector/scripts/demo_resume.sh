@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # 端到端演示：启动服务 -> 起轮次 -> SIGKILL 模拟崩溃 -> 重启自动续跑 -> 查询结果。
+# 暂停/继续的同类演示见 scripts/verify_pause.sh。
 set -u
 BIN=./target/debug/drainage-collector
 BASE=http://127.0.0.1:8080

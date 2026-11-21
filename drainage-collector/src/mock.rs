@@ -5,6 +5,7 @@
 //! - 演示时用 [`router`] 起 axum HTTP 服务，行为与生产站点一致
 //!   （分页变更清单、按修订取页面、临时失败与 Retry-After 注入）。
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
@@ -44,6 +45,7 @@ pub struct MockStation {
     /// 剩余 Retry-After 注入次数。
     pub retry_after_hits: u32,
     pub retry_after_secs: u64,
+
 }
 
 impl MockStation {
@@ -124,9 +126,104 @@ impl MockStation {
     }
 }
 
+/// 按“请求来源标签”统计的页面请求数。测试用它区分：
+/// 暂停的轮次（entry=1）是否真的 0 请求、另一入口（entry=2）是否照常抓取。
+#[derive(Clone, Default)]
+pub struct RequestLedger {
+    counts: Arc<RwLock<HashMap<String, u64>>>,
+    /// 记录每个标签最近一次页面请求的时刻（进程内单调时钟）。
+    last_at: Arc<RwLock<HashMap<String, std::time::Instant>>>,
+    /// 记录每个标签请求过哪些页面，用于核对“已确认抓取被复用”。
+    pages: Arc<RwLock<HashMap<String, std::collections::BTreeSet<String>>>>,
+    /// 记录每个标签每次页面请求的发起时刻，用于核对共用站点的节奏。
+    times: Arc<RwLock<HashMap<String, Vec<std::time::Instant>>>>,
+    /// 按站点记录所有页面请求的发起时刻（不区分入口），用于核对站点节奏。
+    station_times: Arc<RwLock<HashMap<String, Vec<std::time::Instant>>>>,
+}
+
+impl RequestLedger {
+    pub fn record(&self, tag: &str) {
+        self.record_page(tag, "");
+    }
+
+    pub fn record_page(&self, tag: &str, page_key: &str) {
+        self.record_page_on("", tag, page_key);
+    }
+
+    /// 记录一次页面请求：来源标签 + 站点。
+    pub fn record_page_on(&self, station_id: &str, tag: &str, page_key: &str) {
+        if !station_id.is_empty() {
+            self.station_times
+                .write()
+                .unwrap()
+                .entry(station_id.to_string())
+                .or_default()
+                .push(std::time::Instant::now());
+        }
+        let mut g = self.counts.write().unwrap();
+        *g.entry(tag.to_string()).or_insert(0) += 1;
+        self.last_at
+            .write()
+            .unwrap()
+            .insert(tag.to_string(), std::time::Instant::now());
+        self.times
+            .write()
+            .unwrap()
+            .entry(tag.to_string())
+            .or_default()
+            .push(std::time::Instant::now());
+        if !page_key.is_empty() {
+            self.pages
+                .write()
+                .unwrap()
+                .entry(tag.to_string())
+                .or_default()
+                .insert(page_key.to_string());
+        }
+    }
+
+    /// 某站点所有页面请求（不区分入口）的发起时刻。
+    pub fn station_times(&self, station_id: &str) -> Vec<std::time::Instant> {
+        self.station_times
+            .read()
+            .unwrap()
+            .get(station_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 某标签所有页面请求的发起时刻。
+    pub fn times(&self, tag: &str) -> Vec<std::time::Instant> {
+        self.times.read().unwrap().get(tag).cloned().unwrap_or_default()
+    }
+
+    /// 某标签请求过的页面集合。
+    pub fn pages(&self, tag: &str) -> std::collections::BTreeSet<String> {
+        self.pages
+            .read()
+            .unwrap()
+            .get(tag)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn count(&self, tag: &str) -> u64 {
+        self.counts.read().unwrap().get(tag).copied().unwrap_or(0)
+    }
+
+    pub fn total(&self) -> u64 {
+        self.counts.read().unwrap().values().sum()
+    }
+
+    pub fn last_at(&self, tag: &str) -> Option<std::time::Instant> {
+        self.last_at.read().unwrap().get(tag).copied()
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct MockWorld {
     inner: Arc<RwLock<HashMap<String, MockStation>>>,
+    ledger: RequestLedger,
 }
 
 impl MockWorld {
@@ -143,6 +240,11 @@ impl MockWorld {
 
     pub fn get_station(&self, id: &str) -> Option<MockStation> {
         self.inner.read().unwrap().get(id).cloned()
+    }
+
+    /// 按请求来源标签统计页面请求（见 [`RequestLedger`]）。
+    pub fn ledger(&self) -> &RequestLedger {
+        &self.ledger
     }
 
     pub fn with_station(&self, id: &str, f: impl FnOnce(&mut MockStation)) {
@@ -311,8 +413,12 @@ impl MockPageClient {
         page_key: &str,
         target: crate::fetch::FetchTarget,
     ) -> std::result::Result<FetchedPage, PageFetchError> {
-        self.requests
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        self.world.ledger().record_page_on(
+            &station.id,
+            tag_from_url(&station.base_url),
+            page_key,
+        );
         let mut st = self
             .world
             .get_station(&station.id)
@@ -389,6 +495,16 @@ impl PageClient for MockPageClient {
             None
         };
         Ok((entries, next))
+    }
+}
+
+/// 从站点 base_url 取请求来源标签（用于按入口统计模拟站请求）：
+/// `mock://tag@station-a` -> `tag`；`mock://station-a` -> `shared`。
+fn tag_from_url(base_url: &str) -> &str {
+    let rest = base_url.strip_prefix("mock://").unwrap_or(base_url);
+    match rest.split_once('@') {
+        Some((tag, _)) => tag,
+        None => "shared",
     }
 }
 

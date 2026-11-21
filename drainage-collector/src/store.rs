@@ -73,7 +73,7 @@ impl Store {
         sqlx::query("CREATE TABLE IF NOT EXISTS schema_versions (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)")
             .execute(&self.pool)
             .await?;
-        let current: i64 =
+        let mut current: i64 =
             sqlx::query("SELECT COALESCE(MAX(version), 0) AS v FROM schema_versions")
                 .fetch_one(&self.pool)
                 .await?
@@ -88,6 +88,18 @@ impl Store {
                 sqlx::query(stmt).execute(&self.pool).await?;
             }
             sqlx::query("INSERT INTO schema_versions (version, applied_at) VALUES (1, ?)")
+                .bind(now_millis())
+                .execute(&self.pool)
+                .await?;
+            current = 1;
+        }
+        if current < 2 {
+            // 值班员确认暂停的时刻（status = 'paused' 时有效）。
+            // ALTER 是幂等的：只在版本号落后时执行一次。
+            sqlx::query("ALTER TABLE runs ADD COLUMN paused_at INTEGER")
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("INSERT INTO schema_versions (version, applied_at) VALUES (2, ?)")
                 .bind(now_millis())
                 .execute(&self.pool)
                 .await?;
@@ -405,8 +417,8 @@ impl Store {
         let wm = serde_json::to_string(watermarks)?;
         let now = now_millis();
         let row = sqlx::query(
-            "INSERT INTO runs (entry_id, mode, status, watermarks, error, created_at, updated_at) \
-             VALUES (?, ?, 'running', ?, NULL, ?, ?) RETURNING id",
+            "INSERT INTO runs (entry_id, mode, status, watermarks, error, paused_at, created_at, updated_at) \
+             VALUES (?, ?, 'running', ?, NULL, NULL, ?, ?) RETURNING id",
         )
         .bind(entry_id)
         .bind(mode.as_str())
@@ -420,72 +432,24 @@ impl Store {
 
     pub async fn get_run(&self, run_id: i64) -> Result<Run> {
         let row = sqlx::query(
-            "SELECT id, entry_id, mode, status, watermarks, error, created_at, updated_at \
+            "SELECT id, entry_id, mode, status, watermarks, error, paused_at, created_at, updated_at \
              FROM runs WHERE id = ?",
         )
         .bind(run_id)
         .fetch_one(&self.pool)
         .await?;
-        let mode_str: String = row.try_get("mode")?;
-        let status_str: String = row.try_get("status")?;
-        let wm_str: String = row.try_get("watermarks")?;
-        let value: Value =
-            serde_json::from_str(&wm_str).unwrap_or(Value::Object(Default::default()));
-        let mut watermarks = BTreeMap::new();
-        if let Value::Object(map) = value {
-            for (k, v) in map {
-                if let Some(n) = v.as_i64() {
-                    watermarks.insert(k, n);
-                }
-            }
-        }
-        Ok(Run {
-            id: row.try_get("id")?,
-            entry_id: row.try_get("entry_id")?,
-            mode: RunMode::parse(&mode_str)?,
-            status: RunStatus::parse(&status_str),
-            watermarks,
-            error: row.try_get("error")?,
-            created_at: row.try_get("created_at")?,
-            updated_at: row.try_get("updated_at")?,
-        })
+        run_from_row(&row)
     }
 
     pub async fn list_runs(&self, limit: i64) -> Result<Vec<Run>> {
         let rows = sqlx::query(
-            "SELECT id, entry_id, mode, status, watermarks, error, created_at, updated_at \
+            "SELECT id, entry_id, mode, status, watermarks, error, paused_at, created_at, updated_at \
              FROM runs ORDER BY id DESC LIMIT ?",
         )
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        let mut out = Vec::new();
-        for r in rows {
-            let mode_str: String = r.try_get("mode")?;
-            let status_str: String = r.try_get("status")?;
-            let wm_str: String = r.try_get("watermarks")?;
-            let value: Value =
-                serde_json::from_str(&wm_str).unwrap_or(Value::Object(Default::default()));
-            let mut watermarks = BTreeMap::new();
-            if let Value::Object(map) = value {
-                for (k, v) in map {
-                    if let Some(n) = v.as_i64() {
-                        watermarks.insert(k, n);
-                    }
-                }
-            }
-            out.push(Run {
-                id: r.try_get("id")?,
-                entry_id: r.try_get("entry_id")?,
-                mode: RunMode::parse(&mode_str)?,
-                status: RunStatus::parse(&status_str),
-                watermarks,
-                error: r.try_get("error")?,
-                created_at: r.try_get("created_at")?,
-                updated_at: r.try_get("updated_at")?,
-            });
-        }
-        Ok(out)
+        rows.iter().map(run_from_row).collect()
     }
 
     pub async fn update_run_status(
@@ -504,11 +468,65 @@ impl Store {
         Ok(())
     }
 
+    /// 由值班员确认暂停：running -> paused，记录暂停时刻。
+    /// 返回 false 表示该轮次已不在 running（如已结束或已暂停），不做任何改动。
+    /// 原子条件更新保证并发重复暂停只有一次生效。
+    pub async fn pause_run(&self, run_id: i64, paused_at: i64) -> Result<bool> {
+        let row = sqlx::query(
+            "UPDATE runs SET status = 'paused', paused_at = ?, updated_at = ? \
+             WHERE id = ? AND status = 'running' RETURNING id",
+        )
+        .bind(paused_at)
+        .bind(paused_at)
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    /// 继续已暂停的轮次：paused -> running。沿用原轮次与原截止点。
+    /// 返回 false 表示该轮次已不在 paused。
+    pub async fn resume_run(&self, run_id: i64) -> Result<bool> {
+        let row = sqlx::query(
+            "UPDATE runs SET status = 'running', paused_at = NULL, updated_at = ? \
+             WHERE id = ? AND status = 'paused' RETURNING id",
+        )
+        .bind(now_millis())
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    /// 读取轮次状态（轻量单列查询，worker 每个页面检查一次）。
+    pub async fn run_status(&self, run_id: i64) -> Result<Option<RunStatus>> {
+        let row = sqlx::query("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| {
+            let s: String = r.try_get("status").unwrap_or_default();
+            RunStatus::parse(&s)
+        }))
+    }
+
+    /// 把某轮次残留的 fetching（进程退出或刚被暂停）收回为 pending，失败页也允许重试。
+    /// 用于“继续”一个暂停轮次：不重算已确认结果，只重新排队未完成的页面。
+    pub async fn reset_run_pages(&self, run_id: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE run_pages SET state = 'pending' WHERE run_id = ? AND state IN ('fetching','failed')",
+        )
+        .bind(run_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// 重启时把崩溃残留的 fetching 收回为 pending，失败页也允许重试。
     pub async fn reset_open_run_pages(&self) -> Result<()> {
         sqlx::query(
             "UPDATE run_pages SET state = 'pending' WHERE run_id IN \
-             (SELECT id FROM runs WHERE status = 'running') AND state IN ('fetching','failed')",
+             (SELECT id FROM runs WHERE status IN ('running','paused')) AND state IN ('fetching','failed')",
         )
         .execute(&self.pool)
         .await?;
@@ -580,6 +598,47 @@ impl Store {
                 r.try_get::<i64, _>("attempts").unwrap_or_default(),
             )
         }))
+    }
+
+    /// 把已认领但尚未确认的页面放回 pending（暂停/放弃时用，不计失败）。
+    pub async fn requeue_run_page(
+        &self,
+        run_id: i64,
+        station_id: &str,
+        page_key: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE run_pages SET state = 'pending', updated_at = ? \
+             WHERE run_id = ? AND station_id = ? AND page_key = ? AND state = 'fetching'",
+        )
+        .bind(now_millis())
+        .bind(run_id)
+        .bind(station_id)
+        .bind(page_key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 收尾时把轮次从 running 切到终态；若已被确认暂停则保持 paused 并返回 false。
+    /// 原子条件更新，暂停与结束不会互相覆盖。
+    pub async fn settle_run(
+        &self,
+        run_id: i64,
+        status: RunStatus,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        let row = sqlx::query(
+            "UPDATE runs SET status = ?, error = ?, updated_at = ? \
+             WHERE id = ? AND status = 'running' RETURNING id",
+        )
+        .bind(status.as_str())
+        .bind(error)
+        .bind(now_millis())
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
     }
 
     pub async fn complete_run_page(
@@ -766,42 +825,20 @@ impl Store {
         mode: Option<RunMode>,
     ) -> Result<Option<Run>> {
         let rows = sqlx::query(
-            "SELECT id, entry_id, mode, status, watermarks, error, created_at, updated_at \
+            "SELECT id, entry_id, mode, status, watermarks, error, paused_at, created_at, updated_at \
              FROM runs WHERE entry_id = ? AND status = 'succeeded' ORDER BY id DESC LIMIT 20",
         )
         .bind(entry_id)
         .fetch_all(&self.pool)
         .await?;
         for r in rows {
-            let mode_str: String = r.try_get("mode")?;
-            let m = RunMode::parse(&mode_str)?;
+            let run = run_from_row(&r)?;
             if let Some(want) = mode {
-                if m != want {
+                if run.mode != want {
                     continue;
                 }
             }
-            let status_str: String = r.try_get("status")?;
-            let wm_str: String = r.try_get("watermarks")?;
-            let value: Value =
-                serde_json::from_str(&wm_str).unwrap_or(Value::Object(Default::default()));
-            let mut watermarks = BTreeMap::new();
-            if let Value::Object(map) = value {
-                for (k, v) in map {
-                    if let Some(n) = v.as_i64() {
-                        watermarks.insert(k, n);
-                    }
-                }
-            }
-            return Ok(Some(Run {
-                id: r.try_get("id")?,
-                entry_id: r.try_get("entry_id")?,
-                mode: m,
-                status: RunStatus::parse(&status_str),
-                watermarks,
-                error: r.try_get("error")?,
-                created_at: r.try_get("created_at")?,
-                updated_at: r.try_get("updated_at")?,
-            }));
+            return Ok(Some(run));
         }
         Ok(None)
     }
@@ -843,6 +880,33 @@ pub struct RunPageCounts {
     pub pending: i64,
     pub fetching: i64,
     pub failed: i64,
+}
+
+/// 从 runs 行构造 [`Run`]（各查询的 `SELECT` 列集合保持一致）。
+fn run_from_row(row: &sqlx::any::AnyRow) -> Result<Run> {
+    let mode_str: String = row.try_get("mode")?;
+    let status_str: String = row.try_get("status")?;
+    let wm_str: String = row.try_get("watermarks")?;
+    let value: Value = serde_json::from_str(&wm_str).unwrap_or(Value::Object(Default::default()));
+    let mut watermarks = BTreeMap::new();
+    if let Value::Object(map) = value {
+        for (k, v) in map {
+            if let Some(n) = v.as_i64() {
+                watermarks.insert(k, n);
+            }
+        }
+    }
+    Ok(Run {
+        id: row.try_get("id")?,
+        entry_id: row.try_get("entry_id")?,
+        mode: RunMode::parse(&mode_str)?,
+        status: RunStatus::parse(&status_str),
+        watermarks,
+        error: row.try_get("error").ok(),
+        paused_at: row.try_get("paused_at").ok(),
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
 }
 
 pub fn map_err(e: sqlx::Error) -> anyhow::Error {
