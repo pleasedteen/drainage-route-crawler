@@ -5,6 +5,8 @@
 //! SQL 下工作，业务代码不感知方言差异。
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use serde_json::Value;
@@ -19,13 +21,76 @@ pub enum DbKind {
     Postgres,
 }
 
+/// 设施 / 边记录的读写计数。
+///
+/// 只统计 `facilities` 与 `links` 两张表的行级读写，用于验证增量轮次
+/// “只核查受影响路线”的预算；页面正文、队列、可达关系等不计入。
+#[derive(Debug, Default)]
+pub struct StoreIo {
+    pub facility_reads: AtomicU64,
+    pub facility_writes: AtomicU64,
+    pub edge_reads: AtomicU64,
+    pub edge_writes: AtomicU64,
+}
+
+impl StoreIo {
+    pub fn snapshot(&self) -> IoSnapshot {
+        IoSnapshot {
+            facility_reads: self.facility_reads.load(Ordering::SeqCst),
+            facility_writes: self.facility_writes.load(Ordering::SeqCst),
+            edge_reads: self.edge_reads.load(Ordering::SeqCst),
+            edge_writes: self.edge_writes.load(Ordering::SeqCst),
+        }
+    }
+
+    pub fn reset(&self) {
+        self.facility_reads.store(0, Ordering::SeqCst);
+        self.facility_writes.store(0, Ordering::SeqCst);
+        self.edge_reads.store(0, Ordering::SeqCst);
+        self.edge_writes.store(0, Ordering::SeqCst);
+    }
+
+    fn add_facility_reads(&self, n: usize) {
+        self.facility_reads.fetch_add(n as u64, Ordering::SeqCst);
+    }
+    fn add_facility_writes(&self, n: usize) {
+        self.facility_writes.fetch_add(n as u64, Ordering::SeqCst);
+    }
+    fn add_edge_reads(&self, n: usize) {
+        self.edge_reads.fetch_add(n as u64, Ordering::SeqCst);
+    }
+    fn add_edge_writes(&self, n: usize) {
+        self.edge_writes.fetch_add(n as u64, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct IoSnapshot {
+    pub facility_reads: u64,
+    pub facility_writes: u64,
+    pub edge_reads: u64,
+    pub edge_writes: u64,
+}
+
 #[derive(Clone)]
 pub struct Store {
     pub pool: AnyPool,
     pub kind: DbKind,
+    pub io: Arc<StoreIo>,
 }
 
 const DDL: &str = include_str!("../schema/schema.sql");
+
+/// v1 -> v2：增量轮次的受影响路线计划与反向边索引（幂等）。
+const MIGRATION_V2: &str = "\
+CREATE TABLE IF NOT EXISTS run_delta (\
+ run_id INTEGER PRIMARY KEY, base_run_id INTEGER NOT NULL,\
+ inherited INTEGER NOT NULL DEFAULT 0, prepared INTEGER NOT NULL DEFAULT 0);\
+CREATE TABLE IF NOT EXISTS run_delta_pages (\
+ id __PK_AUTO__, run_id INTEGER NOT NULL, station_id TEXT NOT NULL,\
+ page_key TEXT NOT NULL, role TEXT NOT NULL, UNIQUE (run_id, station_id, page_key));\
+CREATE INDEX IF NOT EXISTS ix_run_delta_pages ON run_delta_pages (run_id, role);\
+CREATE INDEX IF NOT EXISTS ix_links_to ON links (to_station_id, to_page_key);";
 
 impl Store {
     /// 连接数据库并完成 schema 初始化 / 升级（幂等，可重复执行）。
@@ -64,7 +129,11 @@ impl Store {
         let pool = AnyPoolOptions::new()
             .max_connections(max_conn)
             .connect_lazy_with(opts);
-        let store = Store { pool, kind };
+        let store = Store {
+            pool,
+            kind,
+            io: Arc::new(StoreIo::default()),
+        };
         store.init_schema().await?;
         Ok(store)
     }
@@ -88,6 +157,25 @@ impl Store {
                 sqlx::query(stmt).execute(&self.pool).await?;
             }
             sqlx::query("INSERT INTO schema_versions (version, applied_at) VALUES (1, ?)")
+                .bind(now_millis())
+                .execute(&self.pool)
+                .await?;
+        }
+        let current: i64 =
+            sqlx::query("SELECT COALESCE(MAX(version), 0) AS v FROM schema_versions")
+                .fetch_one(&self.pool)
+                .await?
+                .try_get("v")?;
+        if current < 2 {
+            let pk = match self.kind {
+                DbKind::Sqlite => "INTEGER PRIMARY KEY AUTOINCREMENT",
+                DbKind::Postgres => "BIGSERIAL PRIMARY KEY",
+            };
+            let ddl = MIGRATION_V2.replace("__PK_AUTO__", pk);
+            for stmt in ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                sqlx::query(stmt).execute(&self.pool).await?;
+            }
+            sqlx::query("INSERT INTO schema_versions (version, applied_at) VALUES (2, ?)")
                 .bind(now_millis())
                 .execute(&self.pool)
                 .await?;
@@ -318,7 +406,66 @@ impl Store {
             .await?;
         }
         tx.commit().await?;
+        self.io.add_edge_writes(links.len());
         Ok(())
+    }
+
+    /// 某页面某修订的下游边（按位置排序）。增量计划据此判断旧路线是否被删除。
+    pub async fn links_at_revision(
+        &self,
+        station_id: &str,
+        page_key: &str,
+        revision: i64,
+    ) -> Result<Vec<LinkRef>> {
+        let rows = sqlx::query(
+            "SELECT to_station_id, to_page_key FROM links \
+             WHERE from_station_id = ? AND from_page_key = ? AND from_revision = ? ORDER BY position",
+        )
+        .bind(station_id)
+        .bind(page_key)
+        .bind(revision)
+        .fetch_all(&self.pool)
+        .await?;
+        self.io.add_edge_reads(rows.len());
+        Ok(rows
+            .into_iter()
+            .map(|r| LinkRef {
+                station_id: r.try_get("to_station_id").unwrap_or_default(),
+                page_key: r.try_get("to_page_key").unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    /// 指向某页面的入边中，来自基线轮次可达页面（且用其基线修订）的那些。
+    /// 用于给“受影响区域”找到仍可用的入口边界，无需扫描整个基线图。
+    pub async fn incoming_reachable_edges(
+        &self,
+        base_run_id: i64,
+        to_station_id: &str,
+        to_page_key: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT l.from_station_id, l.from_page_key \
+             FROM links l JOIN reachable r \
+               ON r.run_id = ? AND r.station_id = l.from_station_id \
+               AND r.page_key = l.from_page_key AND r.revision = l.from_revision \
+             WHERE l.to_station_id = ? AND l.to_page_key = ?",
+        )
+        .bind(base_run_id)
+        .bind(to_station_id)
+        .bind(to_page_key)
+        .fetch_all(&self.pool)
+        .await?;
+        self.io.add_edge_reads(rows.len());
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.try_get("from_station_id").unwrap_or_default(),
+                    r.try_get("from_page_key").unwrap_or_default(),
+                )
+            })
+            .collect())
     }
 
     pub async fn upsert_facility(
@@ -339,6 +486,7 @@ impl Store {
         .bind(&facility.kind)
         .execute(&self.pool)
         .await?;
+        self.io.add_facility_writes(1);
         Ok(())
     }
 
@@ -717,6 +865,7 @@ impl Store {
         .bind(run_id)
         .fetch_all(&self.pool)
         .await?;
+        self.io.add_facility_reads(rows.len());
         Ok(rows
             .into_iter()
             .map(|r| ReachableFacility {
@@ -758,6 +907,163 @@ impl Store {
                 )
             })
             .collect())
+    }
+
+    // ---------- 增量轮次的“受影响路线”计划 ----------
+
+    /// 清空某轮次的工作队列与结果，供增量计划从基线确定性重建（幂等、可续跑）。
+    pub async fn clear_run_results(&self, run_id: i64) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for sql in [
+            "DELETE FROM reachable WHERE run_id = ?",
+            "DELETE FROM run_pages WHERE run_id = ?",
+            "DELETE FROM run_delta_pages WHERE run_id = ?",
+            "DELETE FROM run_delta WHERE run_id = ?",
+        ] {
+            sqlx::query(sql).bind(run_id).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 把基线轮次的可达关系原样继承到新轮次（供增量轮次只改动受影响部分）。
+    pub async fn inherit_reachable_from(&self, from_run: i64, to_run: i64) -> Result<u64> {
+        let res = sqlx::query(
+            "INSERT INTO reachable (run_id, entry_id, station_id, page_key, revision, depth) \
+             SELECT ?, entry_id, station_id, page_key, revision, depth \
+             FROM reachable WHERE run_id = ?",
+        )
+        .bind(to_run)
+        .bind(from_run)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// 把基线轮次的页面工作项（含 done 状态与深度）继承到新轮次。
+    pub async fn inherit_run_pages_from(&self, from_run: i64, to_run: i64) -> Result<u64> {
+        let res = sqlx::query(
+            "INSERT INTO run_pages (run_id, station_id, page_key, state, depth, attempts, last_error, updated_at) \
+             SELECT ?, station_id, page_key, state, depth, attempts, last_error, ? \
+             FROM run_pages WHERE run_id = ?",
+        )
+        .bind(to_run)
+        .bind(now_millis())
+        .bind(from_run)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// 把某页面记为本轮已核验完成（继承页与增量计划页共用）。
+    /// 调用前该页的旧工作项已被删除，故为纯插入；仍保留冲突分支以幂等。
+    pub async fn mark_run_page_done(
+        &self,
+        run_id: i64,
+        station_id: &str,
+        page_key: &str,
+        depth: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO run_pages (run_id, station_id, page_key, state, depth, attempts, last_error, updated_at) \
+             VALUES (?, ?, ?, 'done', ?, 0, NULL, ?) \
+             ON CONFLICT(run_id, station_id, page_key) DO UPDATE SET \
+               state='done', depth=excluded.depth, updated_at=excluded.updated_at",
+        )
+        .bind(run_id)
+        .bind(station_id)
+        .bind(page_key)
+        .bind(depth)
+        .bind(now_millis())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_run_delta(
+        &self,
+        run_id: i64,
+        base_run_id: i64,
+        inherited: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO run_delta (run_id, base_run_id, inherited, prepared) VALUES (?, ?, ?, 0) \
+             ON CONFLICT(run_id) DO UPDATE SET base_run_id=excluded.base_run_id, inherited=excluded.inherited",
+        )
+        .bind(run_id)
+        .bind(base_run_id)
+        .bind(inherited)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn add_run_delta_page(
+        &self,
+        run_id: i64,
+        station_id: &str,
+        page_key: &str,
+        role: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO run_delta_pages (run_id, station_id, page_key, role) VALUES (?, ?, ?, ?) \
+             ON CONFLICT(run_id, station_id, page_key) DO NOTHING",
+        )
+        .bind(run_id)
+        .bind(station_id)
+        .bind(page_key)
+        .bind(role)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_reachable_page(
+        &self,
+        run_id: i64,
+        station_id: &str,
+        page_key: &str,
+    ) -> Result<()> {
+        sqlx::query("DELETE FROM reachable WHERE run_id = ? AND station_id = ? AND page_key = ?")
+            .bind(run_id)
+            .bind(station_id)
+            .bind(page_key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_run_page(
+        &self,
+        run_id: i64,
+        station_id: &str,
+        page_key: &str,
+    ) -> Result<()> {
+        sqlx::query("DELETE FROM run_pages WHERE run_id = ? AND station_id = ? AND page_key = ?")
+            .bind(run_id)
+            .bind(station_id)
+            .bind(page_key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn is_delta_prepared(&self, run_id: i64) -> Result<bool> {
+        let row = sqlx::query("SELECT prepared FROM run_delta WHERE run_id = ?")
+            .bind(run_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row
+            .map(|r| r.try_get::<i64, _>("prepared").unwrap_or(0) != 0)
+            .unwrap_or(false))
+    }
+
+    pub async fn mark_delta_prepared(&self, run_id: i64) -> Result<()> {
+        sqlx::query("UPDATE run_delta SET prepared = 1 WHERE run_id = ?")
+            .bind(run_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn latest_succeeded_run(
