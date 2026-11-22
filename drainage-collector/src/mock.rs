@@ -22,6 +22,55 @@ use serde_json::json;
 use crate::fetch::{FetchedPage, PageClient, PageFetchError};
 use crate::model::{ChangeLogEntry, FacilityInfo, LinkRef, StationConfig};
 
+/// 请求端点种类：三类请求共用同一套故障注入与时间线记录。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointKind {
+    State,
+    Changes,
+    Page,
+}
+
+impl EndpointKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EndpointKind::State => "state",
+            EndpointKind::Changes => "changes",
+            EndpointKind::Page => "page",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "state" => Some(EndpointKind::State),
+            "changes" => Some(EndpointKind::Changes),
+            "page" => Some(EndpointKind::Page),
+            _ => None,
+        }
+    }
+}
+
+/// 一次请求的时间线记录（时间为相对世界创建时刻的毫秒偏移，便于脚本核对）。
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct RequestRecord {
+    /// 相对 MockWorld 创建时刻的毫秒时间戳。
+    pub t_ms: u128,
+    pub station_id: String,
+    pub endpoint: String,
+    pub detail: String,
+    pub outcome: String,
+}
+
+/// 某类端点上排队的故障注入。
+#[derive(Debug, Clone)]
+pub struct FaultSpec {
+    pub kind: EndpointKind,
+    /// 剩余触发次数。
+    pub hits: u32,
+    /// 以 Retry-After 形式返回（true）还是普通 500 暂时失败（false）。
+    pub retry_after: bool,
+    pub secs: u64,
+}
+
 /// 页面的一个历史修订。
 #[derive(Debug, Clone)]
 pub struct PageVersion {
@@ -39,11 +88,13 @@ pub struct MockStation {
     pub pages: HashMap<String, Vec<PageVersion>>,
     pub change_log: Vec<ChangeLogEntry>,
     pub latest_seq: i64,
-    /// 剩余临时失败次数（每次页面请求消耗一次）。
+    /// 剩余临时失败次数（每次页面请求消耗一次）。保留以兼容既有测试。
     pub transient_failures: u32,
-    /// 剩余 Retry-After 注入次数。
+    /// 剩余 Retry-After 注入次数（页面请求）。保留以兼容既有测试。
     pub retry_after_hits: u32,
     pub retry_after_secs: u64,
+    /// 按端点种类排队的故障注入（state/changes/page 均可注入）。
+    pub faults: Vec<FaultSpec>,
 }
 
 impl MockStation {
@@ -56,6 +107,7 @@ impl MockStation {
             transient_failures: 0,
             retry_after_hits: 0,
             retry_after_secs: 1,
+            faults: Vec::new(),
         }
     }
 
@@ -124,9 +176,30 @@ impl MockStation {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct MockWorld {
     inner: Arc<RwLock<HashMap<String, MockStation>>>,
+    /// 全局请求时间线（进程内客户端与 HTTP 模拟站共用同一份记录）。
+    log: Arc<RwLock<Vec<RequestRecord>>>,
+    start: Arc<std::time::Instant>,
+}
+
+impl Default for MockWorld {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+            log: Arc::new(RwLock::new(Vec::new())),
+            start: Arc::new(std::time::Instant::now()),
+        }
+    }
+}
+
+impl std::fmt::Debug for MockWorld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MockWorld")
+            .field("stations", &self.inner.read().unwrap().keys())
+            .finish()
+    }
 }
 
 impl MockWorld {
@@ -150,6 +223,68 @@ impl MockWorld {
         if let Some(s) = g.get_mut(id) {
             f(s);
         }
+    }
+
+    /// 注入故障：对指定站的指定端点（state/changes/page）返回临时失败或 Retry-After。
+    pub fn inject_fault(
+        &self,
+        station_id: &str,
+        kind: EndpointKind,
+        hits: u32,
+        retry_after: bool,
+        secs: u64,
+    ) {
+        self.with_station(station_id, |s| {
+            s.faults.push(FaultSpec {
+                kind,
+                hits,
+                retry_after,
+                secs,
+            });
+        });
+    }
+
+    /// 清空故障队列与请求时间线（每个验证场景开始时调用，保证可重复）。
+    pub fn reset_faults_and_log(&self) {
+        {
+            let mut g = self.inner.write().unwrap();
+            for s in g.values_mut() {
+                s.faults.clear();
+                s.transient_failures = 0;
+                s.retry_after_hits = 0;
+            }
+        }
+        self.log.write().unwrap().clear();
+    }
+
+    /// 记录一次请求。
+    pub fn record(&self, station_id: &str, kind: EndpointKind, detail: &str, outcome: &str) {
+        let rec = RequestRecord {
+            t_ms: self.start.elapsed().as_millis(),
+            station_id: station_id.to_string(),
+            endpoint: kind.as_str().to_string(),
+            detail: detail.to_string(),
+            outcome: outcome.to_string(),
+        };
+        self.log.write().unwrap().push(rec);
+    }
+
+    /// 读取请求时间线快照。
+    pub fn request_log(&self) -> Vec<RequestRecord> {
+        self.log.read().unwrap().clone()
+    }
+
+    /// 取下一条命中指定端点的故障（命中一次消耗一次）。
+    fn take_fault(&self, station_id: &str, kind: EndpointKind) -> Option<FaultSpec> {
+        let mut g = self.inner.write().unwrap();
+        let s = g.get_mut(station_id)?;
+        let pos = s.faults.iter().position(|f| f.kind == kind && f.hits > 0)?;
+        s.faults[pos].hits -= 1;
+        let spec = s.faults[pos].clone();
+        if s.faults[pos].hits == 0 {
+            s.faults.remove(pos);
+        }
+        Some(spec)
     }
 
     /// 构造标准演示图：跨站路线、汇合与回流成环，外加一轮后续修订。
@@ -317,11 +452,29 @@ impl MockPageClient {
             .world
             .get_station(&station.id)
             .ok_or_else(|| PageFetchError::Fatal(format!("未知站点 {}", station.id)))?;
+        // 新版统一故障注入（page 端点）。
+        if let Some(fault) = self.world.take_fault(&station.id, EndpointKind::Page) {
+            self.world.record(
+                &station.id,
+                EndpointKind::Page,
+                page_key,
+                if fault.retry_after { "retry-after" } else { "fail" },
+            );
+            if fault.retry_after {
+                return Err(PageFetchError::RetryAfter(std::time::Duration::from_secs(
+                    fault.secs,
+                )));
+            }
+            return Err(PageFetchError::Transient("模拟临时故障 500".into()));
+        }
+        // 兼容旧版字段的临时失败注入。
         if st.transient_failures > 0 {
             st.transient_failures -= 1;
             self.world.with_station(&station.id, |s| {
                 s.transient_failures = st.transient_failures
             });
+            self.world
+                .record(&station.id, EndpointKind::Page, page_key, "fail");
             return Err(PageFetchError::Transient("模拟临时故障 500".into()));
         }
         if st.retry_after_hits > 0 {
@@ -329,6 +482,8 @@ impl MockPageClient {
             let secs = st.retry_after_secs;
             self.world
                 .with_station(&station.id, |s| s.retry_after_hits = st.retry_after_hits);
+            self.world
+                .record(&station.id, EndpointKind::Page, page_key, "retry-after");
             return Err(PageFetchError::RetryAfter(std::time::Duration::from_secs(
                 secs,
             )));
@@ -340,9 +495,13 @@ impl MockPageClient {
         }
         .ok_or(PageFetchError::Gone)?;
         if version.removed {
+            self.world
+                .record(&station.id, EndpointKind::Page, page_key, "gone");
             return Err(PageFetchError::Gone);
         }
         let (content_type, body) = render(station, page_key, version);
+        self.world
+            .record(&station.id, EndpointKind::Page, page_key, "ok");
         Ok(FetchedPage { body, content_type })
     }
 }
@@ -359,11 +518,30 @@ impl PageClient for MockPageClient {
     }
 
     async fn fetch_state(&self, station: &StationConfig) -> Result<i64> {
-        Ok(self
+        // 状态端点同样支持 Retry-After / 临时失败注入，并写入统一时间线。
+        if let Some(fault) = self.world.take_fault(&station.id, EndpointKind::State) {
+            self.world.record(
+                &station.id,
+                EndpointKind::State,
+                "latest_seq",
+                if fault.retry_after { "retry-after" } else { "fail" },
+            );
+            if fault.retry_after {
+                return Err(PageFetchError::RetryAfter(std::time::Duration::from_secs(
+                    fault.secs,
+                ))
+                .into());
+            }
+            return Err(anyhow::anyhow!("模拟状态端点临时故障 500"));
+        }
+        let seq = self
             .world
             .get_station(&station.id)
             .map(|s| s.latest_seq)
-            .unwrap_or(0))
+            .ok_or_else(|| anyhow::anyhow!("未知站点 {}", station.id))?;
+        self.world
+            .record(&station.id, EndpointKind::State, "latest_seq", "ok");
+        Ok(seq)
     }
 
     async fn fetch_changes(
@@ -371,6 +549,23 @@ impl PageClient for MockPageClient {
         station: &StationConfig,
         after_seq: i64,
     ) -> Result<(Vec<ChangeLogEntry>, Option<i64>)> {
+        // 清单端点同样支持 Retry-After / 临时失败注入，并写入统一时间线。
+        if let Some(fault) = self.world.take_fault(&station.id, EndpointKind::Changes) {
+            let detail = format!("after={after_seq}");
+            self.world.record(
+                &station.id,
+                EndpointKind::Changes,
+                &detail,
+                if fault.retry_after { "retry-after" } else { "fail" },
+            );
+            if fault.retry_after {
+                return Err(PageFetchError::RetryAfter(std::time::Duration::from_secs(
+                    fault.secs,
+                ))
+                .into());
+            }
+            return Err(anyhow::anyhow!("模拟清单端点临时故障 500"));
+        }
         let st = match self.world.get_station(&station.id) {
             Some(s) => s,
             None => return Ok((vec![], None)),
@@ -388,6 +583,12 @@ impl PageClient for MockPageClient {
         } else {
             None
         };
+        self.world.record(
+            &station.id,
+            EndpointKind::Changes,
+            &format!("after={after_seq}"),
+            "ok",
+        );
         Ok((entries, next))
     }
 }
@@ -457,6 +658,8 @@ struct PageQuery {
 struct InjectQuery {
     times: Option<u32>,
     secs: Option<u64>,
+    /// 注入到哪个端点：state / changes / page（缺省 page，兼容旧接口）。
+    endpoint: Option<String>,
 }
 
 pub fn router(world: MockWorld, station_id: &'static str) -> Router {
@@ -466,20 +669,58 @@ pub fn router(world: MockWorld, station_id: &'static str) -> Router {
         .route("/pages/:key", get(page_handler))
         .route("/inject/fail", post(inject_fail_handler))
         .route("/inject/retry-after", post(inject_retry_handler))
+        .route("/inject/fault", post(inject_fault_handler))
+        .route("/requests", get(requests_handler))
+        .route("/reset", post(reset_handler))
         .with_state((world, station_id))
 }
 
 type HttpState = (MockWorld, &'static str);
 
-async fn state_handler(State((world, sid)): State<HttpState>) -> AxumJson<serde_json::Value> {
+/// 把故障规格翻译成 HTTP 响应；无故障返回 None。
+fn fault_response(
+    world: &MockWorld,
+    sid: &str,
+    kind: EndpointKind,
+) -> Option<axum::response::Response> {
+    let fault = world.take_fault(sid, kind)?;
+    if fault.retry_after {
+        Some((
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", fault.secs.to_string())],
+            "rate limited",
+        )
+            .into_response())
+    } else {
+        Some(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    }
+}
+
+async fn state_handler(
+    State((world, sid)): State<HttpState>,
+) -> Result<impl IntoResponse, StatusCode> {
+    if let Some(resp) = fault_response(&world, sid, EndpointKind::State) {
+        world.record(sid, EndpointKind::State, "latest_seq", fault_label(&resp));
+        return Ok(resp);
+    }
     let latest = world.get_station(sid).map(|s| s.latest_seq).unwrap_or(0);
-    AxumJson(json!({ "station_id": sid, "latest_seq": latest }))
+    world.record(sid, EndpointKind::State, "latest_seq", "ok");
+    Ok(AxumJson(json!({ "station_id": sid, "latest_seq": latest })).into_response())
 }
 
 async fn changes_handler(
     State((world, sid)): State<HttpState>,
     Query(q): Query<ChangesQuery>,
-) -> AxumJson<ChangesResp> {
+) -> Result<impl IntoResponse, StatusCode> {
+    if let Some(resp) = fault_response(&world, sid, EndpointKind::Changes) {
+        world.record(
+            sid,
+            EndpointKind::Changes,
+            &format!("after={}", q.after.unwrap_or(0)),
+            fault_label(&resp),
+        );
+        return Ok(resp);
+    }
     let st = world.get_station(sid);
     let after = q.after.unwrap_or(0);
     let page_size = 3;
@@ -495,10 +736,25 @@ async fn changes_handler(
     } else {
         None
     };
-    AxumJson(ChangesResp {
+    world.record(
+        sid,
+        EndpointKind::Changes,
+        &format!("after={after}"),
+        "ok",
+    );
+    Ok(AxumJson(ChangesResp {
         changes: entries,
         next_after,
     })
+    .into_response())
+}
+
+fn fault_label(resp: &axum::response::Response) -> &'static str {
+    if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+        "retry-after"
+    } else {
+        "fail"
+    }
 }
 
 async fn page_handler(
@@ -520,16 +776,24 @@ async fn page_handler(
         max_inflight: 1,
         watermark_seq: 0,
     };
+    // 新版统一故障注入优先。
+    if let Some(resp) = fault_response(&world, sid, EndpointKind::Page) {
+        world.record(sid, EndpointKind::Page, &key, fault_label(&resp));
+        return Ok(resp);
+    }
+    // 兼容旧版字段。
     if st.transient_failures > 0 {
         world.with_station(sid, |s| {
             s.transient_failures = s.transient_failures.saturating_sub(1)
         });
+        world.record(sid, EndpointKind::Page, &key, "fail");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
     if st.retry_after_hits > 0 {
         world.with_station(sid, |s| {
             s.retry_after_hits = s.retry_after_hits.saturating_sub(1)
         });
+        world.record(sid, EndpointKind::Page, &key, "retry-after");
         return Ok((
             StatusCode::TOO_MANY_REQUESTS,
             [("retry-after", st.retry_after_secs.to_string())],
@@ -544,9 +808,11 @@ async fn page_handler(
     }
     .ok_or(StatusCode::NOT_FOUND)?;
     if v.removed {
+        world.record(sid, EndpointKind::Page, &key, "gone");
         return Err(StatusCode::GONE);
     }
     let (ct, body) = render(&cfg, &key, v);
+    world.record(sid, EndpointKind::Page, &key, "ok");
     Ok(match ct.as_str() {
         "text/html" => Html(body).into_response(),
         _ => AxumJson(serde_json::from_str::<serde_json::Value>(&body).unwrap()).into_response(),
@@ -558,8 +824,14 @@ async fn inject_fail_handler(
     Query(q): Query<InjectQuery>,
 ) -> AxumJson<serde_json::Value> {
     let times = q.times.unwrap_or(1);
-    world.with_station(sid, |s| s.transient_failures += times);
-    AxumJson(json!({"ok": true, "transient_failures_queued": times}))
+    // 旧接口默认注入 page 端点；可通过 endpoint 参数指向 state/changes。
+    let kind = q
+        .endpoint
+        .as_deref()
+        .and_then(EndpointKind::parse)
+        .unwrap_or(EndpointKind::Page);
+    world.inject_fault(sid, kind, times, false, 0);
+    AxumJson(json!({"ok": true, "endpoint": kind.as_str(), "failures_queued": times}))
 }
 
 async fn inject_retry_handler(
@@ -567,9 +839,52 @@ async fn inject_retry_handler(
     Query(q): Query<InjectQuery>,
 ) -> AxumJson<serde_json::Value> {
     let secs = q.secs.unwrap_or(1);
-    world.with_station(sid, |s| {
-        s.retry_after_hits += 1;
-        s.retry_after_secs = secs;
-    });
-    AxumJson(json!({"ok": true, "retry_after_next_request_secs": secs}))
+    let times = q.times.unwrap_or(1);
+    let kind = q
+        .endpoint
+        .as_deref()
+        .and_then(EndpointKind::parse)
+        .unwrap_or(EndpointKind::Page);
+    world.inject_fault(sid, kind, times, true, secs);
+    AxumJson(json!({"ok": true, "endpoint": kind.as_str(), "retry_after_next_request_secs": secs, "times": times}))
+}
+
+/// 统一故障注入：POST /inject/fault?endpoint=state|changes|page&kind=retry-after|fail&secs=N&times=N
+async fn inject_fault_handler(
+    State((world, sid)): State<HttpState>,
+    Query(q): Query<FaultInjectQuery>,
+) -> Result<AxumJson<serde_json::Value>, (StatusCode, String)> {
+    let kind = EndpointKind::parse(&q.endpoint)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "endpoint 必须是 state/changes/page".into()))?;
+    let retry_after = q.kind.as_deref().unwrap_or("retry-after") == "retry-after";
+    let times = q.times.unwrap_or(1);
+    let secs = q.secs.unwrap_or(1);
+    world.inject_fault(sid, kind, times, retry_after, secs);
+    Ok(AxumJson(json!({
+        "ok": true,
+        "station": sid,
+        "endpoint": kind.as_str(),
+        "mode": if retry_after { "retry-after" } else { "fail" },
+        "times": times,
+        "secs": secs,
+    })))
+}
+
+#[derive(serde::Deserialize)]
+struct FaultInjectQuery {
+    endpoint: String,
+    kind: Option<String>,
+    times: Option<u32>,
+    secs: Option<u64>,
+}
+
+/// 读取请求时间线：GET /requests
+async fn requests_handler(State((world, _sid)): State<HttpState>) -> AxumJson<serde_json::Value> {
+    AxumJson(json!({ "requests": world.request_log() }))
+}
+
+/// 清空故障与时间线：POST /reset
+async fn reset_handler(State((world, _sid)): State<HttpState>) -> AxumJson<serde_json::Value> {
+    world.reset_faults_and_log();
+    AxumJson(json!({"ok": true}))
 }

@@ -85,11 +85,22 @@ impl Engine {
         }
 
         // 1) 轮次开始：逐站读取并固化登记截止点。
+        //    各站并发读取：某站处于 Retry-After 等待期时只阻塞它自己，
+        //    其他站的截止点照常取得。任一站彻底失败则本轮中止，
+        //    且绝不把该站截止点填成 0（错误直接向上传播）。
         let stations = self.store.list_stations().await?;
         let mut watermarks = BTreeMap::new();
-        for st in &stations {
-            let cutoff = self.fetcher.fetch_state(st).await?;
-            watermarks.insert(st.id.clone(), cutoff);
+        let mut wm_tasks = Vec::new();
+        for st in stations.clone() {
+            let fetcher = self.fetcher.clone();
+            wm_tasks.push(tokio::spawn(async move {
+                let cutoff = fetcher.fetch_state(&st).await?;
+                Ok::<_, anyhow::Error>((st.id.clone(), cutoff))
+            }));
+        }
+        for t in wm_tasks {
+            let (sid, cutoff) = t.await??;
+            watermarks.insert(sid, cutoff);
         }
         let run_id = self.store.create_run(entry_id, mode, &watermarks).await?;
         tracing::info!(run_id, ?mode, entry_id, ?watermarks, "轮次已创建");
@@ -125,13 +136,23 @@ impl Engine {
 
         // 3) 按固化截止点续读各站变更清单并落库（崩溃后重复执行幂等）。
         //    清单同时承担“业务时间可早于登记时间”的正确排序：一切以登记 seq 为准。
-        for st in &stations {
+        //    各站并发翻页：某站收到 Retry-After 进入等待期时只暂停它自己，
+        //    其他站的清单续读与后续页面工作不受影响。
+        let mut change_tasks = Vec::new();
+        for st in stations.clone() {
+            let eng = self.clone();
             let cutoff = *run.watermarks.get(&st.id).unwrap_or(&0);
-            let after = self.max_stored_change_seq(&st.id).await?;
-            let changes = self.fetcher.fetch_changes_until(st, after, cutoff).await?;
-            for c in changes {
-                self.store.insert_change(&c).await?;
-            }
+            change_tasks.push(tokio::spawn(async move {
+                let after = eng.max_stored_change_seq(&st.id).await?;
+                let changes = eng.fetcher.fetch_changes_until(&st, after, cutoff).await?;
+                for c in changes {
+                    eng.store.insert_change(&c).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }));
+        }
+        for t in change_tasks {
+            t.await??;
         }
 
         // 4) 构建页面目标修订索引：(station, page) -> 截止点内最新 (seq, revision)。
@@ -231,8 +252,18 @@ impl Engine {
     ) -> Result<()> {
         let run = self.store.get_run(run_id).await?;
         loop {
-            // 认领一个待处理页面。
-            let claimed = self.store.claim_run_page(run_id).await?;
+            // 计算当前未处于 Retry-After 等待期的站点集合。
+            // 故障站等待期间只认领其他站已就绪的页面，工作槽绝不被故障站占住：
+            // 即使故障站在队列里积压了大量页面，其他站的同阶段任务照常推进。
+            let mut ready = HashSet::new();
+            for sid in station_by_id.keys() {
+                if !self.fetcher.station_paused(sid).await {
+                    ready.insert(sid.clone());
+                }
+            }
+
+            // 只认领就绪站点的待处理页面。
+            let claimed = self.store.claim_run_page_ready(run_id, Some(&ready)).await?;
             let (station_id, page_key, depth, _attempts) = match claimed {
                 Some(v) => v,
                 None => {
@@ -240,7 +271,8 @@ impl Engine {
                     if counts.pending == 0 && counts.fetching == 0 {
                         return Ok(()); // 本 worker 收工
                     }
-                    // 等其他 worker 入队新页面或释放任务。
+                    // 剩余任务都属于等待中的故障站（或等其他 worker 入队）。
+                    // 本 worker 不持有任何任务，轮询等待等待期结束/新任务入队。
                     let notified = self.wake.notified();
                     tokio::pin!(notified);
                     let timeout = tokio::time::sleep(std::time::Duration::from_millis(50));
@@ -261,6 +293,16 @@ impl Engine {
                     continue;
                 }
             };
+
+            // 兜底：认领后、发起请求前若该站刚进入等待期，立刻让出工作槽，
+            // 页面退回 pending，本 worker 转去处理其他站，不在这里睡死。
+            if self.fetcher.station_paused(&station_id).await {
+                self.store
+                    .requeue_run_page(run_id, &station_id, &page_key)
+                    .await?;
+                self.wake.notify_waiters();
+                continue;
+            }
 
             let outcome = self
                 .process_page(&run, &station, &page_key, depth, &target_index)
@@ -295,6 +337,42 @@ impl Engine {
                     self.wake.notify_waiters();
                 }
                 Err(e) => {
+                    // 站点等待期相关错误：等待已在 Fetcher 内写入该站控制器，
+                    // 且等待结束前该站三类请求都不会新发。worker 立即释放工作槽
+                    // 去推进其他站，故障站页面不在这里睡死。
+                    match e.downcast_ref::<PageFetchError>() {
+                        // 发起前就发现处于等待期：本次没有真正发请求，不消耗重试预算。
+                        Some(PageFetchError::StationPaused(_)) => {
+                            self.store
+                                .requeue_run_page(run_id, &station_id, &page_key)
+                                .await?;
+                            self.wake.notify_waiters();
+                            continue;
+                        }
+                        // 真实命中 Retry-After：等待期已生效（耗尽重试后也一样），
+                        // 计入尝试次数；预算用尽则把页面判 failed，避免无限重排。
+                        Some(PageFetchError::RetryAfter(_)) => {
+                            let attempts = self
+                                .store
+                                .requeue_run_page_bump_attempts(
+                                    run_id,
+                                    &station_id,
+                                    &page_key,
+                                    &e.to_string(),
+                                )
+                                .await?;
+                            if attempts >= crate::fetch::MAX_ATTEMPTS as i64 {
+                                tracing::error!(run_id, %station_id, %page_key, attempts, "Retry-After 重试预算用尽，页面判失败");
+                                self.store
+                                    .fail_run_page(run_id, &station_id, &page_key, &e.to_string())
+                                    .await?;
+                            }
+                            self.wake.notify_waiters();
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    // 其他失败（含等待期恰好在返回后结束的边缘情况）按普通失败处理。
                     tracing::warn!(run_id, %station_id, %page_key, error = %e, "页面抓取失败");
                     self.store
                         .fail_run_page(run_id, &station_id, &page_key, &e.to_string())

@@ -3,7 +3,7 @@
 //! 生产用 PostgreSQL（`postgres://...`），本地测试用嵌入式持久化替身 SQLite
 //! （`sqlite://...` 或 `sqlite::memory:`）。两者通过 sqlx 的 `Any` 驱动在同一套
 //! SQL 下工作，业务代码不感知方言差异。
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::str::FromStr;
 
 use anyhow::{anyhow, Result};
@@ -563,15 +563,46 @@ impl Store {
     /// 原子认领一个 pending 页面（两种方言同一 SQL；Any 驱动负责占位符转换，
     /// 并发 worker 间靠行锁串行化，不会重复认领）。
     pub async fn claim_run_page(&self, run_id: i64) -> Result<Option<(String, String, i64, i64)>> {
-        let row = sqlx::query(
-            "UPDATE run_pages SET state = 'fetching', updated_at = ? \
-             WHERE id = (SELECT id FROM run_pages WHERE run_id = ? AND state = 'pending' LIMIT 1) \
-             RETURNING station_id, page_key, depth, attempts",
-        )
-        .bind(now_millis())
-        .bind(run_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        self.claim_run_page_ready(run_id, None).await
+    }
+
+    /// 原子认领一个 pending 页面。
+    ///
+    /// 当 `ready_stations` 为 `Some` 时，只认领处于这些站点的页面——
+    /// 故障站等待期间其页面留在队列里，工作槽让给其他站已就绪的同阶段任务，
+    /// 避免“页面工作槽都被故障站占住”导致整轮停摆。
+    /// 为 `None` 时行为与 [`Self::claim_run_page`] 相同。
+    pub async fn claim_run_page_ready(
+        &self,
+        run_id: i64,
+        ready_stations: Option<&HashSet<String>>,
+    ) -> Result<Option<(String, String, i64, i64)>> {
+        let row = match ready_stations {
+            Some(ready) if !ready.is_empty() => {
+                // 动态构造 IN (?, ?, ...) 占位；站点数在本地规模下很小。
+                let placeholders = (0..ready.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "UPDATE run_pages SET state = 'fetching', updated_at = ? \
+                     WHERE id = (SELECT id FROM run_pages WHERE run_id = ? AND state = 'pending' \
+                     AND station_id IN ({placeholders}) LIMIT 1) \
+                     RETURNING station_id, page_key, depth, attempts"
+                );
+                let mut q = sqlx::query(&sql).bind(now_millis()).bind(run_id);
+                for sid in ready {
+                    q = q.bind(sid);
+                }
+                q.fetch_optional(&self.pool).await?
+            }
+            _ => sqlx::query(
+                "UPDATE run_pages SET state = 'fetching', updated_at = ? \
+                 WHERE id = (SELECT id FROM run_pages WHERE run_id = ? AND state = 'pending' LIMIT 1) \
+                 RETURNING station_id, page_key, depth, attempts",
+            )
+            .bind(now_millis())
+            .bind(run_id)
+            .fetch_optional(&self.pool)
+            .await?,
+        };
         Ok(row.map(|r| {
             (
                 r.try_get::<String, _>("station_id").unwrap_or_default(),
@@ -580,6 +611,55 @@ impl Store {
                 r.try_get::<i64, _>("attempts").unwrap_or_default(),
             )
         }))
+    }
+
+    /// 把已认领（fetching）的页面退回 pending，不计失败。
+    ///
+    /// 用于故障站等待期：worker 主动让出工作槽去处理其他站任务，
+    /// 等待结束后该页面可被任意 worker 重新认领（崩溃恢复路径也会做同样回收）。
+    pub async fn requeue_run_page(
+        &self,
+        run_id: i64,
+        station_id: &str,
+        page_key: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE run_pages SET state = 'pending', updated_at = ? \
+             WHERE run_id = ? AND station_id = ? AND page_key = ? AND state = 'fetching'",
+        )
+        .bind(now_millis())
+        .bind(run_id)
+        .bind(station_id)
+        .bind(page_key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 退回 pending 并把尝试次数 +1（用于真实命中 Retry-After 的重试预算统计）。
+    /// 返回递增后的 attempts；超过预算的重试由调用方决定是否改判 failed。
+    pub async fn requeue_run_page_bump_attempts(
+        &self,
+        run_id: i64,
+        station_id: &str,
+        page_key: &str,
+        last_error: &str,
+    ) -> Result<i64> {
+        let row = sqlx::query(
+            "UPDATE run_pages SET state = 'pending', attempts = attempts + 1, last_error = ?, updated_at = ? \
+             WHERE run_id = ? AND station_id = ? AND page_key = ? AND state = 'fetching' \
+             RETURNING attempts",
+        )
+        .bind(last_error)
+        .bind(now_millis())
+        .bind(run_id)
+        .bind(station_id)
+        .bind(page_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row
+            .map(|r| r.try_get::<i64, _>("attempts").unwrap_or_default())
+            .unwrap_or(0))
     }
 
     pub async fn complete_run_page(

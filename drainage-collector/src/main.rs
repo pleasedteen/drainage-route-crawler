@@ -51,6 +51,12 @@ enum Command {
     Entries,
     /// 列出站点。
     Stations,
+    /// 一键验证：本地 HTTP 模拟站核对 Retry-After 统一等待期与每轮结果。
+    Verify {
+        /// 模拟站 Retry-After 等待秒数。
+        #[arg(long, default_value_t = 1)]
+        wait_secs: u64,
+    },
 }
 
 const DEFAULT_CONFIG: &str = include_str!("../config/local.toml");
@@ -65,6 +71,16 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // verify 自成一体：只依赖本地 HTTP 模拟站与内存库，无需加载配置/外部数据库。
+    if let Command::Verify { wait_secs } = &cli.command {
+        return drainage_collector::verify::run_all(drainage_collector::verify::VerifyOptions {
+            wait_secs: *wait_secs,
+            ..Default::default()
+        })
+        .await;
+    }
+
     let cfg_text = match &cli.config {
         Some(p) => std::fs::read_to_string(p)?,
         None => DEFAULT_CONFIG.to_string(),
@@ -143,6 +159,8 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        // 已在 main 开头提前处理。
+        Command::Verify { .. } => unreachable!(),
     }
 }
 

@@ -19,6 +19,7 @@ pub mod model;
 pub mod parse;
 pub mod seed;
 pub mod store;
+pub mod verify;
 
 pub use engine::Engine;
 pub use store::Store;
