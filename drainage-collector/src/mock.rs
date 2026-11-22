@@ -44,10 +44,14 @@ pub struct MockStation {
     /// 剩余 Retry-After 注入次数。
     pub retry_after_hits: u32,
     pub retry_after_secs: u64,
+    /// 剩余 302 跳转注入次数（仅 HTTP 形态生效；进程内客户端无跳转概念）。
+    pub redirect_hits: u32,
+    /// 跳转目标（Location），可为站内地址或外站地址（用于验证站点访问边界）。
+    pub redirect_to: String,
 }
 
 impl MockStation {
-    fn new(id: &str) -> Self {
+    pub fn new(id: &str) -> Self {
         Self {
             id: id.to_string(),
             pages: HashMap::new(),
@@ -56,6 +60,8 @@ impl MockStation {
             transient_failures: 0,
             retry_after_hits: 0,
             retry_after_secs: 1,
+            redirect_hits: 0,
+            redirect_to: String::new(),
         }
     }
 
@@ -334,16 +340,28 @@ impl MockPageClient {
             )));
         }
         use crate::fetch::FetchTarget;
-        let version = match target {
-            FetchTarget::AtRevision(rev) => st.version_at(page_key, Some(rev)),
-            FetchTarget::AtSeq(seq) => st.version_as_of(page_key, seq),
-        }
-        .ok_or(PageFetchError::Gone)?;
+        let (version, query) = match target {
+            FetchTarget::AtRevision(rev) => (
+                st.version_at(page_key, Some(rev)),
+                format!("?revision={rev}"),
+            ),
+            FetchTarget::AtSeq(seq) => (st.version_as_of(page_key, seq), format!("?as_of={seq}")),
+        };
+        let version = version.ok_or(PageFetchError::Gone)?;
         if version.removed {
             return Err(PageFetchError::Gone);
         }
         let (content_type, body) = render(station, page_key, version);
-        Ok(FetchedPage { body, content_type })
+        // 来源证明：与 HTTP 形态一致的定位符。
+        let source = format!(
+            "{}/pages/{page_key}{query}",
+            station.base_url.trim_end_matches('/')
+        );
+        Ok(FetchedPage {
+            body,
+            content_type,
+            source,
+        })
     }
 }
 
@@ -466,6 +484,7 @@ pub fn router(world: MockWorld, station_id: &'static str) -> Router {
         .route("/pages/:key", get(page_handler))
         .route("/inject/fail", post(inject_fail_handler))
         .route("/inject/retry-after", post(inject_retry_handler))
+        .route("/inject/redirect", post(inject_redirect_handler))
         .with_state((world, station_id))
 }
 
@@ -537,6 +556,11 @@ async fn page_handler(
         )
             .into_response());
     }
+    // 跳转注入：返回 302（站内地址用于合法跳转，外站地址用于验证边界拦截）。
+    if st.redirect_hits > 0 && !st.redirect_to.is_empty() {
+        world.with_station(sid, |s| s.redirect_hits = s.redirect_hits.saturating_sub(1));
+        return Ok(axum::response::Redirect::to(&st.redirect_to).into_response());
+    }
     let v = match (q.revision, q.as_of) {
         (Some(rev), _) => st.version_at(&key, Some(rev)),
         (None, Some(seq)) => st.version_as_of(&key, seq),
@@ -572,4 +596,23 @@ async fn inject_retry_handler(
         s.retry_after_secs = secs;
     });
     AxumJson(json!({"ok": true, "retry_after_next_request_secs": secs}))
+}
+
+#[derive(serde::Deserialize)]
+struct RedirectQuery {
+    /// 跳转目标（Location），需 URL 编码；站内地址或外站地址均可。
+    to: String,
+    times: Option<u32>,
+}
+
+async fn inject_redirect_handler(
+    State((world, sid)): State<HttpState>,
+    Query(q): Query<RedirectQuery>,
+) -> AxumJson<serde_json::Value> {
+    let times = q.times.unwrap_or(1);
+    world.with_station(sid, |s| {
+        s.redirect_to = q.to.clone();
+        s.redirect_hits += times;
+    });
+    AxumJson(json!({"ok": true, "redirect_next_requests": times, "to": q.to}))
 }

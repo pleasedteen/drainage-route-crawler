@@ -13,9 +13,12 @@ use crate::model::{ChangeLogEntry, StationConfig};
 use crate::parse::parse_json_changes;
 
 /// 一次页面抓取的结果。
+#[derive(Debug)]
 pub struct FetchedPage {
     pub body: String,
     pub content_type: String,
+    /// 来源证明：最终取到正文的请求 URL / 定位符（跳转后取最终地址）。
+    pub source: String,
 }
 
 #[derive(Debug)]
@@ -26,6 +29,8 @@ pub enum PageFetchError {
     RetryAfter(Duration),
     /// 永久失败（如 404/410 页面已移除）：本轮不再重试。
     Gone,
+    /// 越出站点访问边界（页键定位越出台账范围，或自动跳转离开发起站点）。
+    OutOfBoundary(String),
     Fatal(String),
 }
 
@@ -35,6 +40,7 @@ impl std::fmt::Display for PageFetchError {
             PageFetchError::Transient(s) => write!(f, "暂时失败: {s}"),
             PageFetchError::RetryAfter(d) => write!(f, "站点要求等待 {}ms", d.as_millis()),
             PageFetchError::Gone => write!(f, "页面已移除 (404/410)"),
+            PageFetchError::OutOfBoundary(s) => write!(f, "越出站点访问边界: {s}"),
             PageFetchError::Fatal(s) => write!(f, "永久失败: {s}"),
         }
     }
@@ -157,6 +163,17 @@ impl HttpPageClient {
         let http = Client::builder()
             .timeout(Duration::from_secs(15))
             .user_agent("drainage-collector/0.1")
+            // 站点访问边界：自动跳转只允许留在发起站点的同源范围内；
+            // 跨源跳转到此打住（响应以 3xx 原样返回，由 fetch_page 判为越界）。
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                match attempt.previous().first() {
+                    Some(origin) if crate::boundary::same_origin(origin, attempt.url()) => {
+                        attempt.follow()
+                    }
+                    Some(_) => attempt.stop(),
+                    None => attempt.follow(),
+                }
+            }))
             .build()?;
         Ok(Self { http })
     }
@@ -170,11 +187,8 @@ impl PageClient for HttpPageClient {
         page_key: &str,
         target: FetchTarget,
     ) -> std::result::Result<FetchedPage, PageFetchError> {
-        let mut url = format!(
-            "{}/pages/{}",
-            station.base_url.trim_end_matches('/'),
-            page_key
-        );
+        // 站点访问边界：页键只能定位到该站配置的台账范围。
+        let mut url = crate::boundary::page_locator(station, page_key)?;
         match target {
             FetchTarget::AtRevision(rev) => url.push_str(&format!("?revision={rev}")),
             FetchTarget::AtSeq(seq) => url.push_str(&format!("?as_of={seq}")),
@@ -189,6 +203,19 @@ impl PageClient for HttpPageClient {
         if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
             return Err(PageFetchError::Gone);
         }
+        if status.is_redirection() {
+            // 重定向策略已拦截跨源跳转：任何回到这里的 3xx 都是越界跳转。
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            return Err(PageFetchError::OutOfBoundary(format!(
+                "自动跳转离开发起站点 {} 的范围: -> {location}",
+                station.id
+            )));
+        }
         if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE {
             if let Some(h) = resp.headers().get(reqwest::header::RETRY_AFTER) {
                 if let Some(d) = parse_retry_after(h.to_str().unwrap_or("")) {
@@ -200,6 +227,8 @@ impl PageClient for HttpPageClient {
         if !status.is_success() {
             return Err(PageFetchError::Transient(format!("HTTP {status}")));
         }
+        // 来源证明取最终生效 URL（含合法站内跳转后的地址）。
+        let source = resp.url().to_string();
         let content_type = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -210,7 +239,11 @@ impl PageClient for HttpPageClient {
             .text()
             .await
             .map_err(|e| PageFetchError::Transient(format!("读取响应失败: {e}")))?;
-        Ok(FetchedPage { body, content_type })
+        Ok(FetchedPage {
+            body,
+            content_type,
+            source,
+        })
     }
 
     async fn fetch_state(&self, station: &StationConfig) -> Result<i64> {
@@ -280,6 +313,8 @@ impl Fetcher {
         page_key: &str,
         target: FetchTarget,
     ) -> std::result::Result<FetchedPage, PageFetchError> {
+        // 站点访问边界：页键只能定位到该站配置的台账范围（对所有客户端统一生效）。
+        crate::boundary::page_locator(station, page_key)?;
         let ctl = self.controller(station).await;
         let mut attempt: u32 = 0;
         loop {
@@ -289,6 +324,10 @@ impl Fetcher {
                 Ok(page) => return Ok(page),
                 Err(PageFetchError::Gone) => return Err(PageFetchError::Gone),
                 Err(PageFetchError::Fatal(m)) => return Err(PageFetchError::Fatal(m)),
+                // 越界是确定性结论，重试无意义。
+                Err(PageFetchError::OutOfBoundary(m)) => {
+                    return Err(PageFetchError::OutOfBoundary(m))
+                }
                 Err(PageFetchError::RetryAfter(d)) => {
                     if attempt >= MAX_ATTEMPTS {
                         return Err(PageFetchError::Transient(format!(

@@ -1,6 +1,7 @@
 //! 本地模拟站点 HTTP 服务：
 //! - 端口 base_port     -> 分页 HTML 站 (station-a)
 //! - 端口 base_port + 1 -> JSON 站 (station-b)
+//!
 //! 两个服务共享同一份演示数据（同进程），分别监听。
 use std::net::SocketAddr;
 
@@ -32,7 +33,8 @@ async fn main() -> anyhow::Result<()> {
     let json_listener = tokio::net::TcpListener::bind(json_addr).await?;
     println!(
         "HTML 模拟站 station-a: http://{html_addr}\nJSON 模拟站 station-b: http://{json_addr}\n\
-         故障注入: POST /inject/fail?times=N  POST /inject/retry-after?secs=N"
+         故障注入: POST /inject/fail?times=N  POST /inject/retry-after?secs=N  \
+         POST /inject/redirect?to=<URL编码的跳转目标>&times=N"
     );
 
     tokio::try_join!(

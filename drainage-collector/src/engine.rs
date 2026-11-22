@@ -5,6 +5,7 @@
 //! 页面目标修订统一由“轮次截止点 + 变更清单”解析。差别只在缓存：
 //! - 全量：从入口重走，已缓存的同修订页面同样直接命中（跨入口共享抓取结果）；
 //! - 增量：变更清单里未出现的页面保持旧修订，缓存命中更多，未修订页面不重复抓。
+//!
 //! 因此到达相同截止点时，两种模式算出的可达关系逐页相同。
 //!
 //! ## 断点续跑
@@ -277,8 +278,14 @@ impl Engine {
                         .await?;
                     // 下游入队；唯一约束负责汇合/成环去重。
                     for l in links {
-                        if !station_by_id.contains_key(&l.station_id) {
+                        let Some(target_station) = station_by_id.get(&l.station_id) else {
                             tracing::warn!(%station_id, %page_key, to_station=%l.station_id, to_page=%l.page_key, "链接指向未配置站点，跳过");
+                            continue;
+                        };
+                        // 站点访问边界：下游页键只能定位到目标站点配置的台账范围；
+                        // 越界链接不入队（合法的站内链接与显式跨站链接不受影响）。
+                        if let Err(e) = crate::boundary::page_locator(target_station, &l.page_key) {
+                            tracing::warn!(%station_id, %page_key, to_station=%l.station_id, to_page=%l.page_key, error=%e, "下游页键越出目标站台账范围，跳过");
                             continue;
                         }
                         self.store
@@ -305,7 +312,7 @@ impl Engine {
         }
     }
 
-    /// 单页处理：缓存命中则零请求，否则抓取并持久化修订。
+    /// 单页处理：缓存命中且带来源证明则零请求，否则抓取（即核实）并持久化修订。
     async fn process_page(
         &self,
         run: &Run,
@@ -330,35 +337,47 @@ impl Engine {
                 .map(|(_, p)| p),
         };
 
-        let page_rev = if let Some(pr) = cached {
-            pr
-        } else {
-            // 2) 缓存未命中，按站节奏抓取（退避/暂停在 Fetcher 内处理）。
-            let fetched = match self.fetcher.fetch_page(station, page_key, request).await {
-                Ok(f) => f,
-                Err(PageFetchError::Gone) => return Ok(ProcessOutcome::Gone),
-                Err(e) => return Err(anyhow!(e)),
-            };
-            let parsed = parse_page(station.format, &station.id, &fetched.body)?;
-            self.store
-                .insert_page_revision(
-                    &station.id,
-                    page_key,
-                    parsed.revision,
-                    &fetched.content_type,
-                    &fetched.body,
-                )
-                .await?;
-            self.store
-                .upsert_facility(&station.id, page_key, parsed.revision, &parsed.facility)
-                .await?;
-            self.store
-                .replace_links(&station.id, page_key, parsed.revision, &parsed.links)
-                .await?;
-            self.store
-                .get_page_revision(&station.id, page_key, parsed.revision)
-                .await?
-                .ok_or_else(|| anyhow!("修订落库后读回失败"))?
+        let page_rev = match cached {
+            // 命中且带来源证明：零请求直接复用（跨入口、跨重启共享核实结果）。
+            Some(pr) if pr.has_provenance() => pr,
+            // 旧库迁移来的缓存缺少来源证明：后续轮次首次用到必须重新核实，
+            // 按未命中处理——重新抓取并把来源证明一并落库。
+            missing_proof => {
+                if missing_proof.is_some() {
+                    tracing::info!(station=%station.id, %page_key, "旧缓存缺少来源证明，重新核实");
+                }
+                // 2) 缓存未命中（或待核实），按站节奏抓取（退避/暂停在 Fetcher 内处理）。
+                let fetched = match self.fetcher.fetch_page(station, page_key, request).await {
+                    Ok(f) => f,
+                    Err(PageFetchError::Gone) => return Ok(ProcessOutcome::Gone),
+                    Err(e) => return Err(anyhow!(e)),
+                };
+                let parsed = parse_page(station.format, &station.id, &fetched.body)?;
+                let provenance = Provenance {
+                    source_url: fetched.source,
+                    verified_run_id: run.id,
+                };
+                self.store
+                    .insert_page_revision(
+                        &station.id,
+                        page_key,
+                        parsed.revision,
+                        &fetched.content_type,
+                        &fetched.body,
+                        &provenance,
+                    )
+                    .await?;
+                self.store
+                    .upsert_facility(&station.id, page_key, parsed.revision, &parsed.facility)
+                    .await?;
+                self.store
+                    .replace_links(&station.id, page_key, parsed.revision, &parsed.links)
+                    .await?;
+                self.store
+                    .get_page_revision(&station.id, page_key, parsed.revision)
+                    .await?
+                    .ok_or_else(|| anyhow!("修订落库后读回失败"))?
+            }
         };
 
         // 3) 解析正文（缓存命中也要解析以取得下游链接）。

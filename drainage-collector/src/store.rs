@@ -27,12 +27,18 @@ pub struct Store {
 
 const DDL: &str = include_str!("../schema/schema.sql");
 
+static DRIVERS: std::sync::Once = std::sync::Once::new();
+
+/// 全局安装 sqlx Any 驱动（幂等；sqlx Any 不会自动注册驱动）。
+/// 测试里的旧库夹具绕过 [`Store::connect`] 直连时也需要先调用它。
+pub fn install_drivers() {
+    DRIVERS.call_once(sqlx::any::install_default_drivers);
+}
+
 impl Store {
     /// 连接数据库并完成 schema 初始化 / 升级（幂等，可重复执行）。
     pub async fn connect(url: &str) -> Result<Self> {
-        // sqlx Any 不会自动注册驱动，全局安装一次即可。
-        static DRIVERS: std::sync::Once = std::sync::Once::new();
-        DRIVERS.call_once(sqlx::any::install_default_drivers);
+        install_drivers();
         let opts = AnyConnectOptions::from_str(url)?;
         let kind = if url.starts_with("postgres") {
             DbKind::Postgres
@@ -88,6 +94,21 @@ impl Store {
                 sqlx::query(stmt).execute(&self.pool).await?;
             }
             sqlx::query("INSERT INTO schema_versions (version, applied_at) VALUES (1, ?)")
+                .bind(now_millis())
+                .execute(&self.pool)
+                .await?;
+        }
+        if current < 2 {
+            // v2：page_revisions 增加来源证明列。旧库迁移来的行这些列保持 NULL，
+            // 即“缺少来源证明”，后续轮次首次用到时由引擎重新核实并写回。
+            for stmt in [
+                "ALTER TABLE page_revisions ADD COLUMN source_url TEXT",
+                "ALTER TABLE page_revisions ADD COLUMN verified_run_id INTEGER",
+                "ALTER TABLE page_revisions ADD COLUMN verified_at INTEGER",
+            ] {
+                sqlx::query(stmt).execute(&self.pool).await?;
+            }
+            sqlx::query("INSERT INTO schema_versions (version, applied_at) VALUES (2, ?)")
                 .bind(now_millis())
                 .execute(&self.pool)
                 .await?;
@@ -210,7 +231,8 @@ impl Store {
         revision: i64,
     ) -> Result<Option<PageRevision>> {
         let row = sqlx::query(
-            "SELECT id, station_id, page_key, revision, content_type, body, fetched_at \
+            "SELECT id, station_id, page_key, revision, content_type, body, fetched_at, \
+                    source_url, verified_run_id, verified_at \
              FROM page_revisions WHERE station_id = ? AND page_key = ? AND revision = ?",
         )
         .bind(station_id)
@@ -226,6 +248,9 @@ impl Store {
             content_type: r.try_get("content_type").unwrap_or_default(),
             body: r.try_get("body").unwrap_or_default(),
             fetched_at: r.try_get("fetched_at").unwrap_or_default(),
+            source_url: r.try_get("source_url").unwrap_or_default(),
+            verified_run_id: r.try_get("verified_run_id").unwrap_or_default(),
+            verified_at: r.try_get("verified_at").unwrap_or_default(),
         }))
     }
 
@@ -236,7 +261,8 @@ impl Store {
         page_key: &str,
     ) -> Result<Option<(i64, PageRevision)>> {
         let row = sqlx::query(
-            "SELECT id, station_id, page_key, revision, content_type, body, fetched_at \
+            "SELECT id, station_id, page_key, revision, content_type, body, fetched_at, \
+                    source_url, verified_run_id, verified_at \
              FROM page_revisions WHERE station_id = ? AND page_key = ? \
              ORDER BY revision DESC LIMIT 1",
         )
@@ -256,11 +282,15 @@ impl Store {
                     content_type: r.try_get("content_type").unwrap_or_default(),
                     body: r.try_get("body").unwrap_or_default(),
                     fetched_at: r.try_get("fetched_at").unwrap_or_default(),
+                    source_url: r.try_get("source_url").unwrap_or_default(),
+                    verified_run_id: r.try_get("verified_run_id").unwrap_or_default(),
+                    verified_at: r.try_get("verified_at").unwrap_or_default(),
                 },
             )
         }))
     }
 
+    /// 写入页面修订并落库来源证明（同一修订重复写入时刷新正文与证明）。
     pub async fn insert_page_revision(
         &self,
         station_id: &str,
@@ -268,18 +298,25 @@ impl Store {
         revision: i64,
         content_type: &str,
         body: &str,
+        provenance: &Provenance,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO page_revisions (station_id, page_key, revision, content_type, body, fetched_at) \
-             VALUES (?, ?, ?, ?, ?, ?) \
+            "INSERT INTO page_revisions (station_id, page_key, revision, content_type, body, fetched_at, \
+                                         source_url, verified_run_id, verified_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(station_id, page_key, revision) DO UPDATE SET \
-               content_type=excluded.content_type, body=excluded.body, fetched_at=excluded.fetched_at",
+               content_type=excluded.content_type, body=excluded.body, fetched_at=excluded.fetched_at, \
+               source_url=excluded.source_url, verified_run_id=excluded.verified_run_id, \
+               verified_at=excluded.verified_at",
         )
         .bind(station_id)
         .bind(page_key)
         .bind(revision)
         .bind(content_type)
         .bind(body)
+        .bind(now_millis())
+        .bind(&provenance.source_url)
+        .bind(provenance.verified_run_id)
         .bind(now_millis())
         .execute(&self.pool)
         .await?;

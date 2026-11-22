@@ -123,6 +123,10 @@ pub struct Run {
 }
 
 /// 页面的某个修订版本（同一页面同一修订只抓取一次，跨入口/跨轮次共享）。
+///
+/// 来源证明（`source_url` / `verified_run_id` / `verified_at`）记录该修订
+/// 由哪一轮次、从哪个来源核实。旧库（schema v1）迁移来的行这些列为空，
+/// 后续轮次首次用到时必须重新核实，核实后写回证明即可跨入口、跨重启复用。
 #[derive(Debug, Clone)]
 pub struct PageRevision {
     pub id: i64,
@@ -132,6 +136,28 @@ pub struct PageRevision {
     pub content_type: String,
     pub body: String,
     pub fetched_at: i64,
+    /// 来源证明：核实来源（最终请求 URL / 定位符）。
+    pub source_url: Option<String>,
+    /// 来源证明：核实该修订的轮次。
+    pub verified_run_id: Option<i64>,
+    /// 来源证明：核实时间（毫秒）。
+    pub verified_at: Option<i64>,
+}
+
+impl PageRevision {
+    /// 是否带有完整来源证明（旧库迁移行没有）。
+    pub fn has_provenance(&self) -> bool {
+        self.source_url.is_some() && self.verified_run_id.is_some()
+    }
+}
+
+/// 写入缓存时一并落库的来源证明。
+#[derive(Debug, Clone)]
+pub struct Provenance {
+    /// 核实来源（最终请求 URL / 定位符）。
+    pub source_url: String,
+    /// 核实该修订的轮次。
+    pub verified_run_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]

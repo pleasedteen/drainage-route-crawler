@@ -15,6 +15,10 @@
 | 同一页面同一修订跨入口共享抓取结果 | `page_revisions` 对 `(station, page, revision)` 唯一约束，全局共享 |
 | 同截止点两种模式可达关系相同 | 两种模式共用同一遍历代码路径，差异仅在缓存命中；`tests/equivalence.rs` 逐页比对 |
 | 跨站、汇合、成环 | 链接带 `station_id`；`run_pages (run, station, page)` 唯一约束天然去重，环不会死循环 |
+| 站点访问边界：下游页键只能定位到目标站点配置的台账范围 | `boundary::page_locator` 由 `base_url` 推导台账根 `{base}/pages/`：页键字符白名单 + URL 规范化后仍须落在台账根内；引擎入队前校验，越界链接跳过；`Fetcher` 抓取前再校验一次兜底 |
+| 自动跳转留在发起站点范围内 | HTTP 重定向策略只跟随同源（scheme/host/端口一致）跳转；跨源 3xx 判为越界错误不重试；合法站内跳转照常跟随（`tests/boundary.rs` 实证） |
+| 缓存来源证明：旧缓存首次用到重新核实，核实后跨入口跨重启复用 | `page_revisions` 增加 `source_url/verified_run_id/verified_at`（schema v2 自动迁移，旧行保持 NULL）；命中无证明缓存时按未命中重新抓取并写回证明，此后零请求复用 |
+| 历史轮次仍能原样查询 | 迁移只加列不改行；核实只写缓存与证明，不改历史 `runs/reachable` 行（`tests/provenance.rs` 用旧库夹具逐字段比对） |
 | 每站独立频率与在途上限 | `StationController`：每站独立的最小发起间隔 + `Semaphore` 在途闸门 |
 | 暂时失败退避重试 | 指数退避 + 抖动，最多 5 次 |
 | 站点要求等待则暂停该站、其他站继续 | 识别 `Retry-After`（秒数或 HTTP-date），只暂停对应站的控制器，其余站不受影响 |
@@ -30,17 +34,18 @@ src/
   lib.rs             模块汇总
   config.rs          TOML 配置
   model.rs           领域模型
-  store.rs           持久层（PostgreSQL / SQLite，schema 自动初始化）
-  schema/schema.sql  建表语句（方言占位符在连接时替换）
-  fetch.rs           抓取：每站频率/并发、退避、Retry-After 暂停
+  store.rs           持久层（PostgreSQL / SQLite，schema 自动初始化与迁移）
+  schema/schema.sql  v1 建表语句（方言占位符在连接时替换；v2+ 迁移在 store.rs）
+  boundary.rs        站点访问边界（页键台账定位、自动跳转同源限制）
+  fetch.rs           抓取：每站频率/并发、退避、Retry-After 暂停、边界执行
   parse.rs           HTML / JSON 页面解析
-  engine.rs          轮次编排、截止点、遍历、断点续跑
-  mock.rs            内存模拟站与 HTTP 模拟站
+  engine.rs          轮次编排、截止点、遍历、断点续跑、缓存核实
+  mock.rs            内存模拟站与 HTTP 模拟站（含故障与跳转注入）
   api.rs             值班员 HTTP 接口
   seed.rs            演示数据
   bin/mock-server.rs 本地 HTML/JSON 模拟站服务
-tests/               9 个集成测试（一致性、缓存、续跑、退避、HTTP API）
-scripts/             一键测试与崩溃续跑演示脚本
+tests/               13 个集成测试（一致性、缓存、边界、来源证明、续跑、HTTP API）
+scripts/             一键测试、边界与来源证明验证、崩溃续跑演示脚本
 config/              本地与生产配置示例
 ```
 
@@ -59,6 +64,17 @@ config/              本地与生产配置示例
 
 依赖已编译时测试阶段约 2–3 秒；即使包含本项目增量编译也在 30 秒左右。
 首次运行会先编译第三方依赖，耗时取决于网络与机器，不计入 80 秒口径。
+
+### 一条命令验证站点边界与缓存来源证明
+
+用本地模拟站（进程内 + HTTP 监听）与旧库夹具（schema v1 的 SQLite 旧库）验证：
+
+```bash
+./scripts/verify_boundary.sh
+```
+
+覆盖：越界页键拦截、合法站内跳转可采、跨站自动跳转拒绝、显式跨站链接可采；
+旧库自动迁移、旧缓存首次用到重新核实、核实后跨入口/跨重启复用、历史轮次原样可查。
 
 ### 启动服务（本地演示，零外部依赖）
 
@@ -123,9 +139,10 @@ curl 'http://127.0.0.1:9100/pages/a1?revision=1'
 curl 'http://127.0.0.1:9100/pages/a1?as_of=2'
 # 分页变更清单（每页 3 条，next_after 为下一页游标）
 curl 'http://127.0.0.1:9100/changes?after=0'
-# 故障注入：临时失败 / Retry-After
+# 故障注入：临时失败 / Retry-After / 302 跳转（to 需 URL 编码）
 curl -X POST 'http://127.0.0.1:9100/inject/fail?times=2'
 curl -X POST 'http://127.0.0.1:9101/inject/retry-after?secs=2'
+curl -X POST 'http://127.0.0.1:9100/inject/redirect?to=http%3A%2F%2F127.0.0.1%3A9100%2Fpages%2Fa2'
 ```
 
 ### 崩溃—重启续跑演示
@@ -183,6 +200,29 @@ SQL 方言差异（自增主键等）在连接初始化时按驱动自动替换�
 - 重启只把没有走完的 `fetching`（进程死亡时不可能有结论）和 `failed`（允许重试）收回；
 - 已 `done` 的页面与已缓存修订不会重复抓取，唯一约束兜底幂等。
 
+### 站点访问边界
+
+边界由站点配置的 `base_url` 推导，不需要额外配置：
+
+1. **页键定位**：台账根为 `{base_url}/pages/`。页键先过字符白名单（单段安全字符，
+   拒绝 `/ \ ? # %` 与 `.`/`..`），再经 URL 规范化校验仍落在台账根内——
+   `../state` 之类的路径逃逸无法定位到台账外的资源。引擎在下游链接入队前校验，
+   `Fetcher` 抓取前再校验一次兜底；越界链接记警告并跳过，不影响其他页面。
+2. **自动跳转**：HTTP 重定向策略只跟随与发起请求同源的跳转；跨源 3xx 判为越界错误，
+   不重试。站内 302（如页面搬家）照常跟随。
+3. **显式跨站链接不受影响**：`data-station` 指向外站的链接以目标站自己的边界发起
+   全新请求，继续可采。
+
+### 缓存来源证明
+
+- `page_revisions` 在 schema v2 增加 `source_url / verified_run_id / verified_at`
+  （旧库打开时自动迁移，只加列不改行，旧行这些列为 NULL）。
+- 每次抓取落库时一并写入来源证明（最终请求 URL、核实轮次、核实时间）。
+- 命中**无证明**的旧缓存时按未命中处理：重新抓取核实并写回证明——
+  旧缓存只在“后续轮次首次用到”时付出一次核实代价。
+- 证明随库持久化，核实后的修订跨入口、跨轮次、跨进程重启零请求复用。
+- 核实只更新缓存与证明，历史轮次的 `runs/reachable` 行不被触碰，原样可查。
+
 ### 抓取节奏与隔离
 
 每个站点一个 `StationController`，各自维护最小请求间隔、在途信号量、暂停时刻。
@@ -208,5 +248,7 @@ SQL 方言差异（自增主键等）在连接初始化时按驱动自动替换�
 | --- | --- |
 | `tests/equivalence.rs` | 全量/增量同截止点可达关系一致；截止点固化使旧轮次不受后续登记影响 |
 | `tests/cache.rs` | 同修订跨入口/跨轮次只抓一次；增量只抓变化页（请求计数实证）；新路线补齐 |
+| `tests/boundary.rs` | 越界页键（路径逃逸/多段路径/未配置站点）拦截不入队；合法站内跳转跟随；跨站自动跳转拒绝；显式跨站链接可采 |
+| `tests/provenance.rs` | 旧库夹具（schema v1）自动迁移；旧缓存首次用到逐页核实（请求计数实证）；核实后跨入口/跨重启零请求复用；历史轮次原样可查 |
 | `tests/resume.rs` | SIGKILL 后续跑且保留进度；Retry-After 只暂停本站；临时失败退避重试 |
 | `tests/http_api.rs` | 真实 HTTP 监听下端到端采集与查询、参数校验 |
