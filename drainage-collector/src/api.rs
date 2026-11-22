@@ -30,6 +30,8 @@ pub fn router(state: AppState) -> Router {
         .route("/runs/:run_id", get(get_run))
         .route("/runs/:run_id/progress", get(run_progress))
         .route("/runs/:run_id/reachable", get(run_reachable))
+        .route("/runs/:run_id/repair", post(start_repair))
+        .route("/runs/:run_id/repair-status", get(repair_status))
         .route("/entries/:entry_id/reachable", get(entry_reachable))
         .with_state(state)
 }
@@ -63,9 +65,7 @@ struct StartBody {
 struct StartResp {
     run_id: i64,
     status: String,
-}
-
-async fn start_run(
+}async fn start_run(
     State(s): State<AppState>,
     Json(body): Json<StartBody>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -151,11 +151,54 @@ async fn run_reachable(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+/// 异步启动历史轮次修复；进度用 `/runs/:id/repair-status` 查询。
+async fn start_repair(
+    State(s): State<AppState>,
+    Path(run_id): Path<i64>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // 先确认轮次存在且不在运行中，避免把明显无效的请求丢进后台。
+    let run = s
+        .store
+        .get_run(run_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if run.status.as_str() == "running" {
+        return Err((StatusCode::CONFLICT, "轮次仍在进行中".into()));
+    }
+    let engine = s.engine.clone();
+    tokio::spawn(async move {
+        if let Err(e) = engine.repair_run(run_id).await {
+            tracing::error!(run_id, error = %e, "修复失败");
+        }
+    });
+    Ok(Json(serde_json::json!({ "run_id": run_id, "status": "repairing" })))
+}
+
+async fn repair_status(
+    State(s): State<AppState>,
+    Path(run_id): Path<i64>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    match s
+        .engine
+        .repair_status(run_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        Some(st) => Ok(Json(serde_json::to_value(st).unwrap()).into_response()),
+        // 尚未开始修复：仍返回 JSON，方便客户端轮询时不因 404 文本而解析失败。
+        None => Ok(Json(serde_json::json!({
+            "run_id": run_id,
+            "status": "none",
+            "message": "该轮次尚未修复",
+        }))
+        .into_response()),
+    }
+}
+
 async fn entry_reachable(
     State(s): State<AppState>,
     Path(entry_id): Path<i64>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    match s
+) -> Result<impl IntoResponse, (StatusCode, String)> {    match s
         .engine
         .entry_reachable(entry_id)
         .await

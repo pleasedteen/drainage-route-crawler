@@ -47,7 +47,7 @@ pub struct MockStation {
 }
 
 impl MockStation {
-    fn new(id: &str) -> Self {
+    pub fn new(id: &str) -> Self {
         Self {
             id: id.to_string(),
             pages: HashMap::new(),

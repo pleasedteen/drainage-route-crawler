@@ -118,8 +118,43 @@ pub struct Run {
     /// site_id -> 本轮截止登记序号
     pub watermarks: BTreeMap<String, i64>,
     pub error: Option<String>,
+    /// 当前对外发布的 `reachable` 结果代次。修复新结果建好后只翻转此指针。
+    pub published_generation: i64,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// 一次历史轮次修复任务的状态。
+#[derive(Debug, Clone, Serialize)]
+pub struct RepairStatus {
+    pub run_id: i64,
+    /// running | succeeded | failed
+    pub status: String,
+    /// 正在构建（或已构建）的结果代次。
+    pub generation: i64,
+    /// 当前对外发布的代次；修复期间保持不变。
+    pub published_generation: i64,
+    pub entry_id: i64,
+    pub total: i64,
+    pub done: i64,
+    pub pending: i64,
+    pub fetching: i64,
+    pub failed: i64,
+    pub error: Option<String>,
+    pub started_at: i64,
+    pub updated_at: i64,
+}
+
+/// 修复命令的结果摘要。
+#[derive(Debug, Clone, Serialize)]
+pub struct RepairOutcome {
+    pub run_id: i64,
+    /// 本次修复构建的代次。
+    pub generation: i64,
+    /// 切换后对外可见的可达设施数。
+    pub reachable: i64,
+    /// 该轮次此前已经修复过且结果在线，未重复执行。
+    pub already_repaired: bool,
 }
 
 /// 页面的某个修订版本（同一页面同一修订只抓取一次，跨入口/跨轮次共享）。

@@ -1,7 +1,11 @@
--- 采集服务持久化 schema。
+-- 采集服务持久化 schema（v1 基线）。
 -- __PK_AUTO__ 占位符在初始化时按方言替换：
 --   SQLite   -> INTEGER PRIMARY KEY AUTOINCREMENT
 --   Postgres -> BIGSERIAL PRIMARY KEY
+--
+-- 注意：本文件是 v1 基线；v1 之后的结构变更（结果代次、修复队列、
+-- 截止点记忆）由 store.rs 的 MIGRATION_V2 在同一事务内补齐，
+-- 新建库同样会走一次迁移，保证新旧库最终结构一致、迁移路径始终被测试覆盖。
 
 CREATE TABLE stations (
     id               TEXT PRIMARY KEY,

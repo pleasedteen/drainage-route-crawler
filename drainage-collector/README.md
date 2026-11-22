@@ -21,6 +21,7 @@
 | 进程退出后重启续跑，保留进度与抓取结果 | 所有状态确认后落库；启动时 `reset_open_run_pages` 把残留 `fetching/failed` 收回 `pending`，`resume_on_boot` 续跑 |
 | 生产 PostgreSQL、本地嵌入式持久化替身 | sqlx `Any` 驱动同一套 SQL 同时支持 Postgres 与 SQLite（本地文件型，零外部依赖） |
 | 分页 HTML 与 JSON 两种模拟站 | `src/mock.rs` + `mock-server` 二进制，两种格式各一站 |
+| 历史成功轮次可按轮次号修复误收的截止点后设施 | `repair <run_id>`：用轮次**原已固化**的截止点重走路线，结果写入新代次，成功后才一次切换；修复期间查询保持原已发布结果 |
 
 ## 目录结构
 
@@ -107,6 +108,10 @@ cargo run -- start 1 --mode incremental --wait   # 增量
 cargo run -- progress 1
 cargo run -- reachable 1
 cargo run -- entry-reachable 1
+
+# 按轮次号修复历史轮次（用原截止点重新核实，成功后一次切换）
+cargo run -- repair 1
+cargo run -- repair-status 1
 ```
 
 ### 独立的 HTML / JSON 模拟站点（可选）
@@ -136,6 +141,37 @@ curl -X POST 'http://127.0.0.1:9101/inject/retry-after?secs=2'
 
 脚本会启动服务、发起轮次、在中途 `SIGKILL` 进程，再重启服务并展示原轮次自动续跑到完成、
 已确认的抓取结果不丢失。
+
+### 历史轮次修复：一条命令验证（本地站点 + 旧库夹具）
+
+```bash
+./scripts/verify_repair.sh
+```
+
+脚本用真实 HTTP 本地模拟站与一份预置的旧库夹具（一个“声称在早期截止点成功、结果却含
+截止点后登记设施”的历史轮次）完整走一遍：注入站点故障使修复失败（查询仍返回原已发布结果、
+代次不切换）→ 故障消除后一条命令接着修 → 结果一次切换 → 校验轮次编号/顺序/截止点不变、
+误收设施消失、再次修复幂等。
+
+### 修复历史成功轮次（误收了截止点之后登记的设施）
+
+```bash
+cargo run -- repair 1            # 按轮次号修复
+cargo run -- repair-status 1     # 查看修复进度/代次
+```
+
+- **按原登记截止点重走**：使用 `runs.watermarks` 里固化的截止点，重新构建目标修订索引并从
+  入口遍历；截止点之后登记的页面/修订不会被误收。
+- **保留轮次编号与历史顺序**：只写新的结果代次，不改 `runs.id`、`created_at`、`mode`、
+  `status`、`watermarks`，也不新增轮次。
+- **修复期间查询不变**：新结果先写下一代 `reachable.generation`，`runs.published_generation`
+  指针在全部页面核实成功后才翻转；失败/中断不翻转，按轮次 `/runs/:id/reachable` 与按入口
+  `/entries/:id/reachable` 始终返回原已发布结果。
+- **重启续修、不重抓**：修复队列（`repair_pages`）与“截止点→修订”记忆（`page_as_of`）都持久化；
+  重启后把残留 `fetching/failed` 收回 `pending` 接着修，已核实的目标修订命中缓存/记忆，零请求。
+- **一次切换、写入量与设施数无关**：切换只是一条 `UPDATE runs SET published_generation=...`，
+  与可达设施数量无关（测试用 `total_changes()` 实测：7 项与 500 项均只写 1 行）。
+- **幂等**：已修复且已切换的轮次再次执行 `repair` 为空操作（`already_repaired=true`）。
 
 ## 生产部署（PostgreSQL）
 
@@ -182,6 +218,16 @@ SQL 方言差异（自增主键等）在连接初始化时按驱动自动替换�
 - 抓取结果、链接、设施、可达关系均在确认后立即落库；
 - 重启只把没有走完的 `fetching`（进程死亡时不可能有结论）和 `failed`（允许重试）收回；
 - 已 `done` 的页面与已缓存修订不会重复抓取，唯一约束兜底幂等。
+- 只能“按截止点取版本”的页面，其核实结果写入 `page_as_of`；重启/再次修复时直接复用，
+  不会因为站点后来又登记了更新的修订而取错或重抓。
+
+### 结果代次与“一次切换”
+
+`reachable` 表带 `generation` 列，`runs.published_generation` 指向当前对外发布的代次。
+普通轮次首次发布即第 1 代；修复写入其后一代。查询（按轮次、按入口、进度计数）都只读已发布代次，
+因此**构建新结果的过程中旧结果完全可见且不变**。全部页面核实成功后，用一条只改一行指针的
+`UPDATE` 完成切换；若修复失败或进程中断，指针不翻转，接着修即可。旧代次行保留在库中，
+便于核对与回滚。
 
 ### 抓取节奏与隔离
 
@@ -200,6 +246,8 @@ SQL 方言差异（自增主键等）在连接初始化时按驱动自动替换�
 | GET | `/runs/:id` | 轮次详情（含固化截止点） |
 | GET | `/runs/:id/progress` | 进度（总数/完成/在途/失败/可达数） |
 | GET | `/runs/:id/reachable` | 该轮次已核实可达设施 |
+| POST | `/runs/:id/repair` | 按原截止点修复历史轮次（后台执行，一次切换） |
+| GET | `/runs/:id/repair-status` | 修复状态（代次/进度/是否已切换） |
 | GET | `/entries/:id/reachable` | 该入口最近成功轮次的可达设施 |
 
 ## 测试覆盖
@@ -209,4 +257,5 @@ SQL 方言差异（自增主键等）在连接初始化时按驱动自动替换�
 | `tests/equivalence.rs` | 全量/增量同截止点可达关系一致；截止点固化使旧轮次不受后续登记影响 |
 | `tests/cache.rs` | 同修订跨入口/跨轮次只抓一次；增量只抓变化页（请求计数实证）；新路线补齐 |
 | `tests/resume.rs` | SIGKILL 后续跑且保留进度；Retry-After 只暂停本站；临时失败退避重试 |
+| `tests/repair.rs` | 截止点后设施不被误收（回归）；按原截止点修复并一次切换；修复期间/失败后查询不变；重启续修不重抓；切换写入量与设施数无关 |
 | `tests/http_api.rs` | 真实 HTTP 监听下端到端采集与查询、参数校验 |

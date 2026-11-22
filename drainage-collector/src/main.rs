@@ -47,6 +47,10 @@ enum Command {
     Reachable { run_id: i64 },
     /// 查询某入口最近成功轮次的可达设施。
     EntryReachable { entry_id: i64 },
+    /// 按轮次号修复历史轮次：用原登记截止点重新核实路线并一次切换结果。
+    Repair { run_id: i64 },
+    /// 查询某轮次的修复状态。
+    RepairStatus { run_id: i64 },
     /// 列出入流口。
     Entries,
     /// 列出站点。
@@ -58,6 +62,7 @@ const DEFAULT_CONFIG: &str = include_str!("../config/local.toml");
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,drainage_collector=debug".into()),
@@ -129,6 +134,26 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Command::Repair { run_id } => {
+            // 一条命令完成修复：失败/中断后可重复执行接着修，成功后再执行为幂等空操作。
+            match engine.repair_run(run_id).await {
+                Ok(out) => {
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("修复失败：{e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        Command::RepairStatus { run_id } => {
+            match engine.repair_status(run_id).await? {
+                Some(s) => println!("{}", serde_json::to_string_pretty(&s)?),
+                None => println!("轮次 {run_id} 尚未修复"),
+            }
+            Ok(())
+        }
         Command::Entries => {
             println!(
                 "{}",
